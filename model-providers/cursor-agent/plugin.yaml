@@ -1,0 +1,6 @@
+name: cursor-agent
+kind: model-provider
+version: 1.0.0
+description: Cursor Agent CLI — Hermes model provider via headless cursor-agent (stream-json, OpenAI-compatible shim)
+author: StrawCoding
+license: MIT
