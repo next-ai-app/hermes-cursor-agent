@@ -12,20 +12,46 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+_logger = logging.getLogger("hermes.plugins.cursor_agent.client")
+
+try:
+    from cursor_sdk import Agent as _SDKAgent, LocalAgentOptions as _SDKLocalOptions
+    _SDK_AVAILABLE = True
+except ImportError:
+    _SDK_AVAILABLE = False
+
 CURSOR_MARKER_BASE_URL = "acp://cursor"
-_DEFAULT_TIMEOUT_SECONDS = 900.0
+_AGENT_TTL_SECONDS = 600.0
+
+
+def _default_timeout_seconds() -> float:
+    raw = os.getenv("HERMES_CURSOR_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 900.0
+
+
+_DEFAULT_TIMEOUT_SECONDS = _default_timeout_seconds()
 
 # `auto` is the only Cursor model guaranteed to be available on this account —
 # the Composer tier ("composer-2.5", "composer-2.5-fast") is out of usage and
@@ -186,60 +212,90 @@ def _materialize_image_url(url: str) -> str | None:
 
 
 def _format_messages_as_prompt(messages: list[dict[str, Any]], *, model: str | None = None) -> str:
-    sections: list[str] = [
-        "You are being used as the active agent backend for Hermes.",
-        "Complete the user's request using your own tools when needed.",
-        "When you are done, reply with a clear final answer for the user.",
-    ]
-    if model:
-        sections.append(f"Hermes requested model: {model}")
+    """Format OpenAI-style messages into a structured prompt for cursor-agent.
 
-    transcript: list[str] = []
+    Uses XML-style role boundaries so the underlying model can clearly
+    distinguish system instructions, user requests, and prior assistant turns
+    — preserving the semantic structure that flat-text concatenation destroys.
+    """
+    system_parts: list[str] = []
+    conversation: list[str] = []
+
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").strip().lower()
-        if role == "tool":
-            role = "tool"
-        elif role not in {"system", "user", "assistant"}:
-            role = "context"
-
         rendered = _render_message_content(message.get("content"))
         if not rendered:
             continue
 
-        label = {
-            "system": "System",
-            "user": "User",
-            "assistant": "Assistant",
-            "tool": "Tool",
-            "context": "Context",
-        }.get(role, role.title())
-        transcript.append(f"{label}:\n{rendered}")
+        if role == "system":
+            system_parts.append(rendered)
+        elif role == "user":
+            conversation.append(f"<user>\n{rendered}\n</user>")
+        elif role == "assistant":
+            conversation.append(f"<assistant>\n{rendered}\n</assistant>")
+        elif role == "tool":
+            conversation.append(f"<tool_result>\n{rendered}\n</tool_result>")
+        else:
+            conversation.append(f"<context>\n{rendered}\n</context>")
 
-    if transcript:
-        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+    sections: list[str] = [
+        "<hermes_instructions>\n"
+        "You are the active agent backend for Hermes.\n"
+        "Complete the user's request using your available tools when needed.\n"
+        "Respond with a clear, complete answer.\n"
+        "</hermes_instructions>",
+    ]
 
-    sections.append("Continue from the latest user request.")
-    return "\n\n".join(section.strip() for section in sections if section and section.strip())
+    if model:
+        sections.append(f'<meta model="{model}" />')
+
+    if system_parts:
+        sections.append("<system>\n" + "\n\n".join(system_parts) + "\n</system>")
+
+    if conversation:
+        sections.append("<conversation>\n" + "\n\n".join(conversation) + "\n</conversation>")
+
+    sections.append("Respond to the latest user message above.")
+    return "\n\n".join(sections)
 
 
-def _extract_assistant_text(event: dict[str, Any]) -> str:
+def _extract_assistant_content(event: dict[str, Any]) -> tuple[str, str]:
+    """Extract text and reasoning content from an assistant stream event.
+
+    Returns ``(text, reasoning)`` where either may be empty.  Handles
+    ``thinking`` / ``reasoning`` content blocks emitted by thinking-capable
+    models (Claude extended-thinking, o-series reasoning, etc.).
+    """
     message = event.get("message")
     if not isinstance(message, dict):
-        return ""
+        return "", ""
     content = message.get("content")
     if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
+        return "", ""
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     for item in content:
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "text":
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type == "text":
             text = item.get("text")
             if isinstance(text, str) and text:
-                parts.append(text)
-    return "".join(parts)
+                text_parts.append(text)
+        elif item_type in ("thinking", "reasoning"):
+            thinking = (
+                item.get("thinking") or item.get("text") or item.get("content") or ""
+            )
+            if isinstance(thinking, str) and thinking:
+                reasoning_parts.append(thinking)
+    return "".join(text_parts), "".join(reasoning_parts)
+
+
+def _extract_assistant_text(event: dict[str, Any]) -> str:
+    text, _ = _extract_assistant_content(event)
+    return text
 
 
 def _make_stream_chunk(
@@ -248,20 +304,21 @@ def _make_stream_chunk(
     model: str,
     finish_reason: str | None = None,
     usage: Any | None = None,
+    reasoning: str | None = None,
 ) -> Any:
     """Build an OpenAI ChatCompletionChunk-compatible object.
 
     The Hermes streaming consumer reads ``chunk.choices[0].delta.content``,
     ``chunk.choices[0].delta.tool_calls`` and ``chunk.choices[0].finish_reason``;
     ``chunk.usage`` / ``chunk.model`` are accessed defensively via ``hasattr``.
-    A SimpleNamespace mirroring that shape is all that's required.
+    ``reasoning`` / ``reasoning_content`` carry thinking-model chain-of-thought.
     """
     delta = SimpleNamespace(
         role=None,
         content=content,
         tool_calls=None,
-        reasoning=None,
-        reasoning_content=None,
+        reasoning=reasoning,
+        reasoning_content=reasoning,
         reasoning_details=None,
     )
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
@@ -279,16 +336,19 @@ def parse_cursor_stream_line(line: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def parse_cursor_stream_events(lines: list[str]) -> tuple[str, str | None]:
+def parse_cursor_stream_events(lines: list[str]) -> tuple[str, str | None, str, Any]:
     """Parse NDJSON lines from cursor-agent stream-json output.
 
-    Returns (response_text, error_message). Prefers the canonical ``result`` event;
-    falls back to concatenated streaming assistant deltas (``timestamp_ms`` present,
-    ``model_call_id`` absent).
+    Returns ``(response_text, error_message, reasoning_text, usage)``.
+    Prefers the canonical ``result`` event; falls back to concatenated
+    streaming assistant deltas.  Reasoning (thinking) tokens and real
+    usage stats from the ``result`` event are captured and returned.
     """
     streaming_parts: list[str] = []
+    reasoning_parts: list[str] = []
     final_result = ""
     error_message: str | None = None
+    usage: Any = None
 
     for line in lines:
         event = parse_cursor_stream_line(line)
@@ -300,15 +360,31 @@ def parse_cursor_stream_events(lines: list[str]) -> tuple[str, str | None]:
             has_ts = "timestamp_ms" in event
             has_model_call = "model_call_id" in event
             if has_ts and not has_model_call:
-                chunk = _extract_assistant_text(event)
-                if chunk:
-                    streaming_parts.append(chunk)
+                chunk_text, chunk_reasoning = _extract_assistant_content(event)
+                if chunk_text:
+                    streaming_parts.append(chunk_text)
+                if chunk_reasoning:
+                    reasoning_parts.append(chunk_reasoning)
             elif not has_ts and not has_model_call:
-                chunk = _extract_assistant_text(event)
-                if chunk and not streaming_parts:
-                    final_result = chunk
+                chunk_text, chunk_reasoning = _extract_assistant_content(event)
+                if chunk_text and not streaming_parts:
+                    final_result = chunk_text
+                if chunk_reasoning:
+                    reasoning_parts.append(chunk_reasoning)
         elif event_type == "result":
             subtype = str(event.get("subtype") or "").strip().lower()
+            usage_data = event.get("usage")
+            if isinstance(usage_data, dict):
+                input_tokens = usage_data.get("inputTokens", 0)
+                output_tokens = usage_data.get("outputTokens", 0)
+                usage = SimpleNamespace(
+                    prompt_tokens=input_tokens,
+                    completion_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    prompt_tokens_details=SimpleNamespace(
+                        cached_tokens=usage_data.get("cacheReadTokens", 0),
+                    ),
+                )
             if subtype == "success":
                 result_text = event.get("result")
                 if isinstance(result_text, str) and result_text.strip():
@@ -320,11 +396,13 @@ def parse_cursor_stream_events(lines: list[str]) -> tuple[str, str | None]:
                 elif err is not None:
                     error_message = str(err)
 
+    reasoning = "".join(reasoning_parts).strip()
+
     if final_result:
-        return final_result, error_message
+        return final_result, error_message, reasoning, usage
 
     streamed = "".join(streaming_parts).strip()
-    return streamed, error_message
+    return streamed, error_message, reasoning, usage
 
 
 def parse_cursor_list_models_output(stdout: str) -> list[str]:
@@ -376,15 +454,26 @@ class _CursorChatCompletions:
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
-        # When Hermes requests ``stream=True`` it iterates the return value as
-        # an OpenAI-style chunk stream (``for chunk in stream`` reading
-        # ``chunk.choices[0].delta.content``).  cursor-agent already emits
-        # incremental ``assistant`` deltas over stream-json, so forward them
-        # live instead of buffering the whole reply — this is what makes text
-        # appear progressively in Open WebUI and cuts perceived latency.
-        if kwargs.get("stream"):
-            return self._client._create_chat_completion_stream(**kwargs)
-        return self._client._create_chat_completion(**kwargs)
+        client = self._client
+        is_stream = kwargs.get("stream")
+
+        # Try SDK path first for proper multi-turn conversation support.
+        if _SDK_AVAILABLE and not client._sdk_disabled:
+            try:
+                if is_stream:
+                    return client._sdk_chat_completion_stream(**kwargs)
+                return client._sdk_chat_completion(**kwargs)
+            except Exception as exc:
+                _logger.warning(
+                    "SDK %s failed (%s), falling back to CLI",
+                    "stream" if is_stream else "completion",
+                    exc,
+                )
+                client._sdk_disabled = True
+
+        if is_stream:
+            return client._create_chat_completion_stream(**kwargs)
+        return client._create_chat_completion(**kwargs)
 
 
 class _AsyncCursorChatCompletions:
@@ -451,6 +540,12 @@ class CursorAgentClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        # SDK multi-turn agent cache
+        self._sdk_agents: dict[str, Any] = {}
+        self._sdk_activity: dict[str, float] = {}
+        self._sdk_msg_counts: dict[str, int] = {}
+        self._sdk_lock = threading.Lock()
+        self._sdk_disabled = False
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -458,16 +553,226 @@ class CursorAgentClient:
             proc = self._active_process
             self._active_process = None
         self.is_closed = True
-        if proc is None:
+        if proc is None and not self._sdk_agents:
             return
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
+        if proc is not None:
             try:
-                proc.kill()
+                proc.terminate()
+                proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        with self._sdk_lock:
+            for agent in self._sdk_agents.values():
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+            self._sdk_agents.clear()
+            self._sdk_activity.clear()
+            self._sdk_msg_counts.clear()
+
+    # ------------------------------------------------------------------
+    # SDK multi-turn agent methods
+    # ------------------------------------------------------------------
+
+    def _conv_id(self, messages: list[dict[str, Any]]) -> str:
+        """Hash the first system + user messages to fingerprint a conversation."""
+        parts: list[str] = []
+        for msg in messages[:2]:
+            if isinstance(msg, dict):
+                role = str(msg.get("role", ""))
+                content = _render_message_content(msg.get("content"))[:300]
+                parts.append(f"{role}:{content}")
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+    def _cleanup_stale_agents(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, t in self._sdk_activity.items() if now - t > _AGENT_TTL_SECONDS]
+        for key in stale:
+            agent = self._sdk_agents.pop(key, None)
+            self._sdk_activity.pop(key, None)
+            self._sdk_msg_counts.pop(key, None)
+            if agent is not None:
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+
+    def _sdk_get_or_create_agent(
+        self, conv_id: str, model: str
+    ) -> tuple[Any, bool]:
+        """Return ``(agent, is_new_conversation)``."""
+        with self._sdk_lock:
+            self._cleanup_stale_agents()
+            if conv_id in self._sdk_agents:
+                self._sdk_activity[conv_id] = time.monotonic()
+                return self._sdk_agents[conv_id], False
+
+            api_key = _resolve_api_key(
+                self.api_key if self.api_key != "cursor-agent" else None
+            )
+            agent = _SDKAgent.create(
+                model=model,
+                api_key=api_key or None,
+                local=_SDKLocalOptions(cwd=self._cursor_cwd),
+            )
+            self._sdk_agents[conv_id] = agent
+            self._sdk_activity[conv_id] = time.monotonic()
+            self._sdk_msg_counts[conv_id] = 0
+            return agent, True
+
+    def _sdk_build_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        is_new: bool,
+    ) -> str:
+        """Build prompt for SDK agent.send().
+
+        New conversation: system context + latest user message.
+        Follow-up: just the latest user message (agent already has context).
+        """
+        if is_new:
+            system_parts: list[str] = []
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    content = _render_message_content(msg.get("content"))
+                    if content:
+                        system_parts.append(content)
+            user_msg = ""
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_msg = _render_message_content(msg.get("content"))
+                    break
+            if system_parts and user_msg:
+                return "\n\n".join(system_parts) + "\n\n" + user_msg
+            return user_msg or _format_messages_as_prompt(messages)
+
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return _render_message_content(msg.get("content"))
+        return ""
+
+    def _sdk_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        **_: Any,
+    ) -> Any:
+        """Non-streaming completion via Cursor SDK (multi-turn)."""
+        msgs = messages or []
+        resolved_model = model or _resolve_default_model()
+        conv_id = self._conv_id(msgs)
+        agent, is_new = self._sdk_get_or_create_agent(conv_id, resolved_model)
+
+        prompt = self._sdk_build_prompt(msgs, is_new)
+        if not prompt:
+            raise RuntimeError("No user message found in messages")
+
+        run = agent.send(prompt)
+
+        response_text = ""
+        reasoning_text = ""
+
+        for msg in run.stream():
+            msg_type = getattr(msg, "type", "")
+            if msg_type == "assistant":
+                message_obj = getattr(msg, "message", None)
+                if message_obj:
+                    for block in getattr(message_obj, "content", []):
+                        if getattr(block, "type", "") == "text":
+                            response_text += getattr(block, "text", "")
+            elif msg_type == "thinking":
+                thinking = getattr(msg, "text", "")
+                if thinking:
+                    reasoning_text += thinking
+
+        result = run.wait()
+        if hasattr(result, "result") and result.result:
+            response_text = result.result
+
+        with self._sdk_lock:
+            self._sdk_msg_counts[conv_id] = len(msgs) + 1
+
+        usage = SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        assistant_message = SimpleNamespace(
+            content=response_text,
+            tool_calls=[],
+            reasoning=reasoning_text or None,
+            reasoning_content=reasoning_text or None,
+            reasoning_details=None,
+        )
+        choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
+        return SimpleNamespace(
+            choices=[choice],
+            usage=usage,
+            model=resolved_model,
+        )
+
+    def _sdk_chat_completion_stream(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        **_: Any,
+    ) -> Any:
+        """Streaming completion via Cursor SDK — yields OpenAI chunks."""
+        msgs = messages or []
+        resolved_model = model or _resolve_default_model()
+        conv_id = self._conv_id(msgs)
+        agent, is_new = self._sdk_get_or_create_agent(conv_id, resolved_model)
+
+        prompt = self._sdk_build_prompt(msgs, is_new)
+        if not prompt:
+            raise RuntimeError("No user message found in messages")
+
+        run = agent.send(prompt)
+
+        for msg in run.stream():
+            msg_type = getattr(msg, "type", "")
+            if msg_type == "assistant":
+                message_obj = getattr(msg, "message", None)
+                if message_obj:
+                    for block in getattr(message_obj, "content", []):
+                        if getattr(block, "type", "") == "text":
+                            text = getattr(block, "text", "")
+                            if text:
+                                yield _make_stream_chunk(text, model=resolved_model)
+            elif msg_type == "thinking":
+                thinking = getattr(msg, "text", "")
+                if thinking:
+                    yield _make_stream_chunk(
+                        None, model=resolved_model, reasoning=thinking
+                    )
+
+        run.wait()
+
+        with self._sdk_lock:
+            self._sdk_msg_counts[conv_id] = len(msgs) + 1
+
+        usage = SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        yield _make_stream_chunk(
+            None, model=resolved_model, finish_reason="stop", usage=usage
+        )
+
+    # ------------------------------------------------------------------
+    # CLI-based methods (fallback when SDK unavailable)
+    # ------------------------------------------------------------------
 
     def _create_chat_completion(
         self,
@@ -479,7 +784,7 @@ class CursorAgentClient:
     ) -> Any:
         prompt_text = _format_messages_as_prompt(messages or [], model=model)
         if timeout is None:
-            effective_timeout = _DEFAULT_TIMEOUT_SECONDS
+            effective_timeout = _default_timeout_seconds()
         elif isinstance(timeout, (int, float)):
             effective_timeout = float(timeout)
         else:
@@ -490,13 +795,13 @@ class CursorAgentClient:
             numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
             effective_timeout = max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text = self._run_prompt(
+        response_text, reasoning_text, real_usage = self._run_prompt(
             prompt_text,
             model=model or _resolve_default_model(),
             timeout_seconds=effective_timeout,
         )
 
-        usage = SimpleNamespace(
+        usage = real_usage or SimpleNamespace(
             prompt_tokens=0,
             completion_tokens=0,
             total_tokens=0,
@@ -505,8 +810,8 @@ class CursorAgentClient:
         assistant_message = SimpleNamespace(
             content=response_text,
             tool_calls=[],
-            reasoning=None,
-            reasoning_content=None,
+            reasoning=reasoning_text or None,
+            reasoning_content=reasoning_text or None,
             reasoning_details=None,
         )
         choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
@@ -518,7 +823,7 @@ class CursorAgentClient:
 
     def _resolve_timeout(self, timeout: Any) -> float:
         if timeout is None:
-            return _DEFAULT_TIMEOUT_SECONDS
+            return _default_timeout_seconds()
         if isinstance(timeout, (int, float)):
             return float(timeout)
         candidates = [
@@ -552,14 +857,13 @@ class CursorAgentClient:
         )
 
     def _run_prompt_stream(self, prompt_text: str, *, model: str, timeout_seconds: float):
-        command = self._build_command(
-            prompt_text=prompt_text, model=model, stream_partial=True
-        )
+        command = self._build_command(model=model, stream_partial=True)
         stderr_tail: deque[str] = deque(maxlen=40)
 
         try:
             proc = subprocess.Popen(
                 command,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -576,6 +880,8 @@ class CursorAgentClient:
         if proc.stdout is None or proc.stderr is None:
             proc.kill()
             raise RuntimeError("cursor-agent did not expose stdout/stderr pipes.")
+
+        self._spawn_stdin_writer(proc, prompt_text)
 
         self.is_closed = False
         with self._active_process_lock:
@@ -610,6 +916,8 @@ class CursorAgentClient:
         streamed_any = False
         final_result = ""
         error_message: str | None = None
+        accumulated_reasoning = ""
+        real_usage: Any = None
 
         try:
             assert proc.stdout is not None
@@ -622,16 +930,34 @@ class CursorAgentClient:
                     has_ts = "timestamp_ms" in event
                     has_model_call = "model_call_id" in event
                     if has_ts and not has_model_call:
-                        chunk_text = _extract_assistant_text(event)
-                        if chunk_text:
+                        chunk_text, chunk_reasoning = _extract_assistant_content(event)
+                        if chunk_text or chunk_reasoning:
                             streamed_any = True
-                            yield _make_stream_chunk(chunk_text, model=model)
+                            yield _make_stream_chunk(
+                                chunk_text or None,
+                                model=model,
+                                reasoning=chunk_reasoning or None,
+                            )
                     elif not has_ts and not has_model_call:
-                        chunk_text = _extract_assistant_text(event)
+                        chunk_text, chunk_reasoning = _extract_assistant_content(event)
                         if chunk_text and not final_result:
                             final_result = chunk_text
+                        if chunk_reasoning:
+                            accumulated_reasoning += chunk_reasoning
                 elif event_type == "result":
                     subtype = str(event.get("subtype") or "").strip().lower()
+                    usage_data = event.get("usage")
+                    if isinstance(usage_data, dict):
+                        input_tokens = usage_data.get("inputTokens", 0)
+                        output_tokens = usage_data.get("outputTokens", 0)
+                        real_usage = SimpleNamespace(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=input_tokens + output_tokens,
+                            prompt_tokens_details=SimpleNamespace(
+                                cached_tokens=usage_data.get("cacheReadTokens", 0),
+                            ),
+                        )
                     if subtype == "success":
                         result_text = event.get("result")
                         if isinstance(result_text, str) and result_text.strip():
@@ -677,7 +1003,11 @@ class CursorAgentClient:
         # aggregated text as a single chunk so the reply is never empty.
         if not streamed_any:
             if final_result:
-                yield _make_stream_chunk(final_result, model=model)
+                yield _make_stream_chunk(
+                    final_result,
+                    model=model,
+                    reasoning=accumulated_reasoning or None,
+                )
             elif error_message:
                 raise RuntimeError(f"cursor-agent failed: {error_message}")
             elif proc.returncode not in (0, None):
@@ -686,17 +1016,15 @@ class CursorAgentClient:
             elif stderr_text:
                 raise RuntimeError(f"cursor-agent produced no response: {stderr_text}")
 
-        usage = SimpleNamespace(
+        final_usage = real_usage or SimpleNamespace(
             prompt_tokens=0,
             completion_tokens=0,
             total_tokens=0,
             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
-        yield _make_stream_chunk(None, model=model, finish_reason="stop", usage=usage)
+        yield _make_stream_chunk(None, model=model, finish_reason="stop", usage=final_usage)
 
-    def _build_command(
-        self, *, prompt_text: str, model: str, stream_partial: bool = False
-    ) -> list[str]:
+    def _build_command(self, *, model: str, stream_partial: bool = False) -> list[str]:
         cmd = [
             self._cursor_command,
             "-p",
@@ -718,16 +1046,48 @@ class CursorAgentClient:
         if api_key:
             cmd.extend(["--api-key", api_key])
         cmd.extend(self._cursor_args)
-        cmd.append(prompt_text)
+        # NOTE: the prompt is deliberately NOT appended as a positional CLI arg.
+        # A long conversation transcript can exceed Linux MAX_ARG_STRLEN (128 KiB
+        # per single argv string) and raise OSError [Errno 7] Argument list too
+        # long before the process even starts. The prompt is fed via stdin
+        # instead (cursor-agent reads the prompt from stdin in --print mode).
         return cmd
 
-    def _run_prompt(self, prompt_text: str, *, model: str, timeout_seconds: float) -> str:
-        command = self._build_command(prompt_text=prompt_text, model=model)
+    @staticmethod
+    def _spawn_stdin_writer(proc: "subprocess.Popen[str]", prompt_text: str) -> threading.Thread:
+        """Write the prompt to the child's stdin from a dedicated thread.
+
+        Writing inline would deadlock when ``prompt_text`` exceeds the OS pipe
+        buffer (~64 KiB): the child blocks writing stdout while we block writing
+        stdin. A separate writer thread lets stdout drain concurrently.
+        """
+
+        def _writer() -> None:
+            if proc.stdin is None:
+                return
+            try:
+                proc.stdin.write(prompt_text)
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except (BrokenPipeError, ValueError, OSError):
+                    pass
+
+        thread = threading.Thread(target=_writer, daemon=True)
+        thread.start()
+        return thread
+
+    def _run_prompt(self, prompt_text: str, *, model: str, timeout_seconds: float) -> tuple[str, str, Any]:
+        command = self._build_command(model=model)
         stderr_tail: deque[str] = deque(maxlen=40)
 
         try:
             proc = subprocess.Popen(
                 command,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -744,6 +1104,8 @@ class CursorAgentClient:
         if proc.stdout is None or proc.stderr is None:
             proc.kill()
             raise RuntimeError("cursor-agent did not expose stdout/stderr pipes.")
+
+        self._spawn_stdin_writer(proc, prompt_text)
 
         self.is_closed = False
         with self._active_process_lock:
@@ -777,7 +1139,7 @@ class CursorAgentClient:
                     self._active_process = None
             self.is_closed = True
 
-        response_text, stream_error = parse_cursor_stream_events(stdout_lines)
+        response_text, stream_error, reasoning_text, real_usage = parse_cursor_stream_events(stdout_lines)
         stderr_text = "\n".join(stderr_tail).strip()
 
         # Transparent recovery: if the requested model is out of usage it emits
@@ -796,7 +1158,7 @@ class CursorAgentClient:
             raise RuntimeError(f"cursor-agent failed: {stream_error}")
 
         if response_text:
-            return response_text
+            return response_text, reasoning_text, real_usage
 
         if proc.returncode not in (0, None):
             detail = stderr_text or stream_error or f"exit code {proc.returncode}"
@@ -805,4 +1167,4 @@ class CursorAgentClient:
         if stderr_text:
             raise RuntimeError(f"cursor-agent produced no response: {stderr_text}")
 
-        return ""
+        return "", "", None

@@ -424,6 +424,7 @@ def _patch_resolve_provider_client():
         api_mode=None,
         main_runtime=None,
         is_vision=False,
+        task=None,
     ):
         if _is_cursor_provider(provider):
             from hermes_cli.auth import resolve_external_process_provider_credentials
@@ -477,6 +478,7 @@ def _patch_resolve_provider_client():
             api_mode=api_mode,
             main_runtime=main_runtime,
             is_vision=is_vision,
+            task=task,
         )
 
     auxiliary_client.resolve_provider_client = _wrapped
