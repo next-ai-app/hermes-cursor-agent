@@ -732,6 +732,10 @@ class CursorAgentClient:
         self._sdk_agents: dict[str, Any] = {}
         self._sdk_activity: dict[str, float] = {}
         self._sdk_msg_counts: dict[str, int] = {}
+        # Running tally of cheap incremental turns vs full-transcript
+        # replays, logged on each replay so a chronically desyncing setup
+        # (e.g. over-eager context compression) is visible in the logs.
+        self._sdk_turn_stats: dict[str, int] = {"incremental": 0, "replay": 0}
         self._sdk_lock = threading.Lock()
         # monotonic deadline until which the SDK path is skipped (0 = active)
         self._sdk_disabled_until = 0.0
@@ -941,6 +945,7 @@ class CursorAgentClient:
                 prompt = _render_message_content(msgs[-1].get("content"))
                 if prompt:
                     self._sdk_activity[conv_key] = time.monotonic()
+                    self._sdk_turn_stats["incremental"] += 1
                     return agent, prompt
             if agent is not None:
                 _logger.info(
@@ -956,6 +961,17 @@ class CursorAgentClient:
                 stale_agent.close()
             except Exception:
                 pass
+
+        with self._sdk_lock:
+            self._sdk_turn_stats["replay"] += 1
+            inc = self._sdk_turn_stats["incremental"]
+            rep = self._sdk_turn_stats["replay"]
+        _logger.info(
+            "SDK turn stats: %d incremental / %d replay (%.0f%% incremental)",
+            inc,
+            rep,
+            100.0 * inc / (inc + rep),
+        )
 
         agent, _ = self._sdk_get_or_create_agent(conv_key, model)
         return agent, _format_messages_as_prompt(msgs, model=model)

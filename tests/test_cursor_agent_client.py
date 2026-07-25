@@ -493,3 +493,23 @@ def test_fetch_models_falls_back_to_cli_when_sdk_fails(monkeypatch):
     assert out == ["auto", "composer-2.5"]
     assert cli_called
     _clear_models_cache()
+
+
+def test_sdk_turn_stats_track_incremental_vs_replay(monkeypatch):
+    instances = _install_fake_sdk(monkeypatch)
+    client = _make_client()
+    turn1 = [_m("system", "Be concise."), _m("user", "Hello")]
+    client._sdk_chat_completion(model="auto", messages=turn1)  # replay (new agent)
+
+    turn2 = turn1 + [_m("assistant", "fake-reply"), _m("user", "And now?")]
+    client._sdk_chat_completion(model="auto", messages=turn2)  # incremental
+
+    turn3 = turn2 + [
+        _m("assistant", "fake-reply"),
+        _m("tool", "tool output"),
+        _m("user", "next"),
+    ]
+    client._sdk_chat_completion(model="auto", messages=turn3)  # replay (desync)
+
+    assert client._sdk_turn_stats == {"incremental": 1, "replay": 2}
+    assert len(instances) == 2
