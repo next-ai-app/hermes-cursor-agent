@@ -31,6 +31,8 @@ CURSOR_MARKER_BASE_URL = "acp://cursor"
 CURSOR_ALIASES = frozenset({"cursor-agent", "cursor", "cursor-cli"})
 
 _FALLBACK_MODELS = (
+    "auto",
+    "claude-fable-5",
     "composer-2.5-fast",
     "composer-2.5",
     "gpt-5.5-medium",
@@ -720,7 +722,60 @@ def _patch_conversation_streaming():
 
 
 # ---------------------------------------------------------------------------
-# 11d. model_normalize — strip vendor-only prefix for cursor-agent models
+# 11d. gateway.run — deliver restart/startup notifications reliably
+#
+# Core-gateway race (not cursor-specific; patched here because this plugin is
+# the maintained user plugin on this install): right after a (re)start the
+# Telegram adapter marks its send path degraded until the first getUpdates
+# long-poll completes (~10s), but the gateway fires its "restarted" / "online"
+# notification about 1s after connect and never retries. The restart itself
+# succeeds, yet the confirmation is always dropped with `send_path_degraded`,
+# so from chat it looks like /restart did nothing. Wait (bounded) for the
+# send path to become healthy before sending.
+# ---------------------------------------------------------------------------
+@_safe_patch("gateway.run.notification_send_path_wait")
+def _patch_gateway_notifications():
+    import asyncio
+    import time as _time
+
+    from gateway import run as gateway_run
+
+    runner_cls = gateway_run.GatewayRunner
+
+    async def _wait_send_path_ready(runner, timeout: float = 60.0) -> None:
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            adapters = list(getattr(runner, "adapters", {}).values() or ())
+            if adapters and not any(
+                getattr(adapter, "_send_path_degraded", False)
+                for adapter in adapters
+            ):
+                return
+            await asyncio.sleep(0.5)
+
+    _orig_restart = runner_cls._send_restart_notification
+    if not getattr(_orig_restart, "_cursor_plugin_wrapped", False):
+
+        async def _restart_wrapped(self):
+            await _wait_send_path_ready(self)
+            return await _orig_restart(self)
+
+        _restart_wrapped._cursor_plugin_wrapped = True  # type: ignore[attr-defined]
+        runner_cls._send_restart_notification = _restart_wrapped
+
+    _orig_home = runner_cls._send_home_channel_startup_notifications
+    if not getattr(_orig_home, "_cursor_plugin_wrapped", False):
+
+        async def _home_wrapped(self, **kwargs):
+            await _wait_send_path_ready(self)
+            return await _orig_home(self, **kwargs)
+
+        _home_wrapped._cursor_plugin_wrapped = True  # type: ignore[attr-defined]
+        runner_cls._send_home_channel_startup_notifications = _home_wrapped
+
+
+# ---------------------------------------------------------------------------
+# 11e. model_normalize — strip vendor-only prefix for cursor-agent models
 # ---------------------------------------------------------------------------
 @_safe_patch("model_normalize._STRIP_VENDOR_ONLY_PROVIDERS")
 def _patch_model_normalize():
@@ -765,6 +820,7 @@ _MODULE_PATCHES = {
     "hermes_cli.doctor": (_patch_doctor,),
     "agent.conversation_loop": (_patch_conversation_streaming,),
     "hermes_cli.model_normalize": (_patch_model_normalize,),
+    "gateway.run": (_patch_gateway_notifications,),
 }
 
 _auth_done = [False]

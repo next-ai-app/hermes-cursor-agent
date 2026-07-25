@@ -36,7 +36,33 @@ except ImportError:
     _SDK_AVAILABLE = False
 
 CURSOR_MARKER_BASE_URL = "acp://cursor"
-_AGENT_TTL_SECONDS = 600.0
+
+
+def _agent_ttl_seconds() -> float:
+    """Idle TTL for cached SDK agents.
+
+    A longer TTL keeps the cheap incremental path alive across natural chat
+    pauses (every replay resends the full transcript), at the cost of idle
+    cursor-sdk-bridge processes lingering a bit longer.
+    """
+    raw = os.getenv("HERMES_CURSOR_AGENT_TTL_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 3600.0
+
+
+_AGENT_TTL_SECONDS = _agent_ttl_seconds()
+
+# After an SDK failure, route through the CLI for this long and then retry
+# the SDK. Permanently disabling on first failure meant a single transient
+# bridge hiccup downgraded the whole process to full-transcript-per-request
+# CLI mode until restart.
+_SDK_FAILURE_COOLDOWN_SECONDS = 300.0
 
 
 def _default_timeout_seconds() -> float:
@@ -211,6 +237,35 @@ def _materialize_image_url(url: str) -> str | None:
     return path
 
 
+def _render_tool_calls_block(tool_calls: Any) -> str:
+    """Render assistant tool calls so a replayed transcript keeps the link
+    between each call (name + arguments) and its subsequent tool result."""
+    if not isinstance(tool_calls, list):
+        return ""
+    parts: list[str] = []
+    for call in tool_calls:
+        if isinstance(call, dict):
+            call_id = str(call.get("id") or "").strip()
+            function = call.get("function")
+            name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            arguments = function.get("arguments") if isinstance(function, dict) else None
+        else:
+            call_id = str(getattr(call, "id", "") or "").strip()
+            function = getattr(call, "function", None)
+            name = str(getattr(function, "name", "") or "")
+            arguments = getattr(function, "arguments", None)
+        if not isinstance(arguments, str):
+            try:
+                arguments = json.dumps(arguments, ensure_ascii=True)
+            except Exception:
+                arguments = str(arguments)
+        if not name and not arguments.strip():
+            continue
+        id_attr = f' id="{call_id}"' if call_id else ""
+        parts.append(f'<tool_call{id_attr} name="{name}">\n{arguments}\n</tool_call>')
+    return "\n".join(parts)
+
+
 def _format_messages_as_prompt(messages: list[dict[str, Any]], *, model: str | None = None) -> str:
     """Format OpenAI-style messages into a structured prompt for cursor-agent.
 
@@ -226,6 +281,17 @@ def _format_messages_as_prompt(messages: list[dict[str, Any]], *, model: str | N
             continue
         role = str(message.get("role") or "unknown").strip().lower()
         rendered = _render_message_content(message.get("content"))
+
+        if role == "assistant":
+            # An assistant turn may be tool calls only (content=None); it
+            # must still appear in the transcript or the following tool
+            # results lose their provenance.
+            tool_calls_block = _render_tool_calls_block(message.get("tool_calls"))
+            body = "\n".join(part for part in (rendered, tool_calls_block) if part)
+            if body:
+                conversation.append(f"<assistant>\n{body}\n</assistant>")
+            continue
+
         if not rendered:
             continue
 
@@ -233,10 +299,10 @@ def _format_messages_as_prompt(messages: list[dict[str, Any]], *, model: str | N
             system_parts.append(rendered)
         elif role == "user":
             conversation.append(f"<user>\n{rendered}\n</user>")
-        elif role == "assistant":
-            conversation.append(f"<assistant>\n{rendered}\n</assistant>")
         elif role == "tool":
-            conversation.append(f"<tool_result>\n{rendered}\n</tool_result>")
+            call_id = str(message.get("tool_call_id") or "").strip()
+            id_attr = f' call_id="{call_id}"' if call_id else ""
+            conversation.append(f"<tool_result{id_attr}>\n{rendered}\n</tool_result>")
         else:
             conversation.append(f"<context>\n{rendered}\n</context>")
 
@@ -323,6 +389,64 @@ def _make_stream_chunk(
     )
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model=model, usage=usage)
+
+
+def _sdk_run_error(result: Any) -> str | None:
+    """Extract an error message from a finished SDK run result, if any.
+
+    Without this check a failed run (e.g. out of usage) surfaced as a silent
+    empty reply instead of triggering the CLI fallback.
+    """
+    if result is None:
+        return None
+    error = getattr(result, "error", None)
+    subtype = str(getattr(result, "subtype", "") or "").strip().lower()
+    is_error = bool(getattr(result, "is_error", False))
+    if error or is_error or subtype in ("error", "failure", "failed"):
+        detail = error or getattr(result, "result", None) or subtype or "unknown error"
+        return str(detail)
+    return None
+
+
+def _usage_field(source: Any, *names: str) -> int:
+    for name in names:
+        value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return 0
+
+
+def _sdk_extract_usage(result: Any) -> Any | None:
+    """Map SDK run usage onto the OpenAI usage shape Hermes reads.
+
+    Real token counts feed Hermes' cost tracking and context-compression
+    triggers; reporting zeros disabled both.
+    """
+    usage_data = getattr(result, "usage", None)
+    if usage_data is None:
+        return None
+    input_tokens = _usage_field(usage_data, "input_tokens", "inputTokens", "prompt_tokens")
+    output_tokens = _usage_field(
+        usage_data, "output_tokens", "outputTokens", "completion_tokens"
+    )
+    if not input_tokens and not output_tokens:
+        return None
+    cached = _usage_field(usage_data, "cache_read_tokens", "cacheReadTokens", "cached_tokens")
+    return SimpleNamespace(
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+    )
+
+
+def _zero_usage() -> Any:
+    return SimpleNamespace(
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
 
 
 def parse_cursor_stream_line(line: str) -> dict[str, Any] | None:
@@ -419,7 +543,39 @@ def parse_cursor_list_models_output(stdout: str) -> list[str]:
     return models
 
 
-def fetch_cursor_models(
+_MODELS_CACHE_TTL_SECONDS = 300.0
+_models_cache: dict[str, Any] = {"at": 0.0, "ids": None}
+
+
+def _fetch_cursor_models_sdk(*, api_key: str | None = None) -> list[str] | None:
+    """Model ids from the Cursor SDK catalog (``Cursor.models.list``).
+
+    The SDK path is what actually serves chat turns, so its catalog — not
+    the CLI's variant-flavoured ``--list-models`` output — is the
+    authoritative list for the /model picker.
+    """
+    if not _SDK_AVAILABLE:
+        return None
+    try:
+        from cursor_sdk import Cursor
+
+        rows = Cursor.models.list(api_key=api_key or _resolve_api_key() or None)
+    except Exception as exc:
+        _logger.debug("SDK model listing failed (%s); falling back to CLI", exc)
+        return None
+    ids: list[str] = []
+    for row in rows or ():
+        model_id = str(getattr(row, "id", "") or "").strip()
+        if model_id == "default":
+            # The send path accepts "auto" for the default model, and that is
+            # the id users already have in config.yaml.
+            model_id = "auto"
+        if model_id and model_id not in ids:
+            ids.append(model_id)
+    return ids or None
+
+
+def _fetch_cursor_models_cli(
     *,
     command: str | None = None,
     api_key: str | None = None,
@@ -449,6 +605,39 @@ def fetch_cursor_models(
     return models or None
 
 
+def fetch_cursor_models(
+    *,
+    command: str | None = None,
+    api_key: str | None = None,
+    timeout: float = 15.0,
+    force_refresh: bool = False,
+) -> list[str] | None:
+    """Fetch the Cursor model catalog: SDK first, CLI fallback, short cache.
+
+    Both backends take seconds (SDK HTTP call / CLI subprocess), and the
+    /model picker may query more than once per interaction, so successful
+    results are cached briefly.
+    """
+    now = time.monotonic()
+    cached = _models_cache.get("ids")
+    if (
+        not force_refresh
+        and cached
+        and now - float(_models_cache.get("at") or 0.0) < _MODELS_CACHE_TTL_SECONDS
+    ):
+        return list(cached)
+
+    models = _fetch_cursor_models_sdk(api_key=api_key)
+    if not models:
+        models = _fetch_cursor_models_cli(
+            command=command, api_key=api_key, timeout=timeout
+        )
+    if models:
+        _models_cache["at"] = now
+        _models_cache["ids"] = list(models)
+    return models or None
+
+
 class _CursorChatCompletions:
     def __init__(self, client: "CursorAgentClient"):
         self._client = client
@@ -458,18 +647,17 @@ class _CursorChatCompletions:
         is_stream = kwargs.get("stream")
 
         # Try SDK path first for proper multi-turn conversation support.
-        if _SDK_AVAILABLE and not client._sdk_disabled:
+        if _SDK_AVAILABLE and client._sdk_active():
+            if is_stream:
+                # Generators run lazily: returning the raw SDK generator here
+                # would move all SDK errors outside this try/except (they only
+                # fire once Hermes iterates). The wrapper catches them at
+                # iteration time and still falls back to the CLI.
+                return client._sdk_stream_with_cli_fallback(**kwargs)
             try:
-                if is_stream:
-                    return client._sdk_chat_completion_stream(**kwargs)
                 return client._sdk_chat_completion(**kwargs)
             except Exception as exc:
-                _logger.warning(
-                    "SDK %s failed (%s), falling back to CLI",
-                    "stream" if is_stream else "completion",
-                    exc,
-                )
-                client._sdk_disabled = True
+                client._mark_sdk_failure("completion", exc)
 
         if is_stream:
             return client._create_chat_completion_stream(**kwargs)
@@ -545,7 +733,8 @@ class CursorAgentClient:
         self._sdk_activity: dict[str, float] = {}
         self._sdk_msg_counts: dict[str, int] = {}
         self._sdk_lock = threading.Lock()
-        self._sdk_disabled = False
+        # monotonic deadline until which the SDK path is skipped (0 = active)
+        self._sdk_disabled_until = 0.0
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -553,8 +742,6 @@ class CursorAgentClient:
             proc = self._active_process
             self._active_process = None
         self.is_closed = True
-        if proc is None and not self._sdk_agents:
-            return
         if proc is not None:
             try:
                 proc.terminate()
@@ -578,23 +765,119 @@ class CursorAgentClient:
     # SDK multi-turn agent methods
     # ------------------------------------------------------------------
 
-    def _conv_id(self, messages: list[dict[str, Any]]) -> str:
-        """Hash the first system + user messages to fingerprint a conversation."""
-        parts: list[str] = []
-        for msg in messages[:2]:
-            if isinstance(msg, dict):
-                role = str(msg.get("role", ""))
-                content = _render_message_content(msg.get("content"))[:300]
-                parts.append(f"{role}:{content}")
-        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    def _sdk_active(self) -> bool:
+        return time.monotonic() >= self._sdk_disabled_until
+
+    def _mark_sdk_failure(self, where: str, exc: BaseException) -> None:
+        self._sdk_disabled_until = time.monotonic() + _SDK_FAILURE_COOLDOWN_SECONDS
+        _logger.warning(
+            "SDK %s failed (%s); using CLI for the next %.0fs",
+            where,
+            exc,
+            _SDK_FAILURE_COOLDOWN_SECONDS,
+        )
+
+    def _sdk_stream_with_cli_fallback(self, **kwargs: Any) -> Any:
+        """Iterate the SDK stream, falling back to the CLI on failure.
+
+        Errors raised before the first chunk reaches the consumer are fully
+        recoverable, so the whole turn is retried via the CLI. Once chunks
+        have been delivered a CLI replay would duplicate visible output, so
+        the error is surfaced for this turn only (the cooldown makes the next
+        turn take the CLI path).
+        """
+        yielded = False
+        try:
+            for chunk in self._sdk_chat_completion_stream(**kwargs):
+                yielded = True
+                yield chunk
+            return
+        except Exception as exc:
+            self._mark_sdk_failure("stream", exc)
+            if yielded:
+                raise
+        yield from self._create_chat_completion_stream(**kwargs)
+
+    def _conv_key(self, messages: list[dict[str, Any]], model: str) -> str:
+        """Fingerprint a conversation for the agent cache.
+
+        Hashes the *full* first system and first user message — Hermes system
+        prompts share identical openings across sessions, so truncated
+        prefixes collided and let unrelated sessions steal each other's
+        agents. The model is part of the key so a mid-session /model switch
+        gets a fresh agent (with full replay) instead of silently reusing an
+        agent created for the old model.
+        """
+        first_system = ""
+        first_user = ""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "system" and not first_system:
+                first_system = _render_message_content(msg.get("content"))
+            elif role == "user" and not first_user:
+                first_user = _render_message_content(msg.get("content"))
+            if first_system and first_user:
+                break
+        return hashlib.sha256(
+            f"{first_system}\x00{first_user}\x00{model}".encode()
+        ).hexdigest()[:16]
+
+    def _sdk_evict_locked(self, conv_key: str) -> Any | None:
+        """Drop a cached agent; caller holds ``_sdk_lock`` and closes it."""
+        agent = self._sdk_agents.pop(conv_key, None)
+        self._sdk_activity.pop(conv_key, None)
+        self._sdk_msg_counts.pop(conv_key, None)
+        return agent
+
+    def _sdk_evict(self, conv_key: str, expected: Any | None = None) -> None:
+        """Remove and close a cached agent (no-op if ``expected`` mismatches)."""
+        with self._sdk_lock:
+            if expected is not None and self._sdk_agents.get(conv_key) is not expected:
+                return
+            agent = self._sdk_evict_locked(conv_key)
+        if agent is not None:
+            try:
+                agent.close()
+            except Exception:
+                pass
+
+    def _sdk_start_watchdog(
+        self, conv_key: str, agent: Any, run: Any, timeout_seconds: float
+    ) -> tuple[threading.Event, threading.Event]:
+        """Abort a hung SDK run after ``timeout_seconds``.
+
+        ``run.stream()`` reads block indefinitely; without a watchdog the
+        whole Hermes turn froze forever (the CLI path already had one).
+        """
+        done = threading.Event()
+        timed_out = threading.Event()
+
+        def _watchdog() -> None:
+            if done.wait(timeout_seconds):
+                return
+            timed_out.set()
+            for target in (run, agent):
+                for name in ("cancel", "kill", "close"):
+                    method = getattr(target, name, None)
+                    if callable(method):
+                        try:
+                            method()
+                        except Exception:
+                            pass
+                        break
+            # The agent was force-closed; drop it so the next turn replays.
+            self._sdk_evict(conv_key, expected=agent)
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+        return done, timed_out
 
     def _cleanup_stale_agents(self) -> None:
         now = time.monotonic()
         stale = [k for k, t in self._sdk_activity.items() if now - t > _AGENT_TTL_SECONDS]
         for key in stale:
-            agent = self._sdk_agents.pop(key, None)
-            self._sdk_activity.pop(key, None)
-            self._sdk_msg_counts.pop(key, None)
+            agent = self._sdk_evict_locked(key)
             if agent is not None:
                 try:
                     agent.close()
@@ -602,14 +885,14 @@ class CursorAgentClient:
                     pass
 
     def _sdk_get_or_create_agent(
-        self, conv_id: str, model: str
+        self, conv_key: str, model: str
     ) -> tuple[Any, bool]:
         """Return ``(agent, is_new_conversation)``."""
         with self._sdk_lock:
             self._cleanup_stale_agents()
-            if conv_id in self._sdk_agents:
-                self._sdk_activity[conv_id] = time.monotonic()
-                return self._sdk_agents[conv_id], False
+            if conv_key in self._sdk_agents:
+                self._sdk_activity[conv_key] = time.monotonic()
+                return self._sdk_agents[conv_key], False
 
             api_key = _resolve_api_key(
                 self.api_key if self.api_key != "cursor-agent" else None
@@ -619,41 +902,63 @@ class CursorAgentClient:
                 api_key=api_key or None,
                 local=_SDKLocalOptions(cwd=self._cursor_cwd),
             )
-            self._sdk_agents[conv_id] = agent
-            self._sdk_activity[conv_id] = time.monotonic()
-            self._sdk_msg_counts[conv_id] = 0
+            self._sdk_agents[conv_key] = agent
+            self._sdk_activity[conv_key] = time.monotonic()
+            self._sdk_msg_counts[conv_key] = 0
             return agent, True
 
-    def _sdk_build_prompt(
+    def _sdk_prepare_turn(
         self,
-        messages: list[dict[str, Any]],
-        is_new: bool,
-    ) -> str:
-        """Build prompt for SDK agent.send().
+        conv_key: str,
+        model: str,
+        msgs: list[dict[str, Any]],
+    ) -> tuple[Any, str]:
+        """Return ``(agent, prompt)`` via a hybrid incremental/replay strategy.
 
-        New conversation: system context + latest user message.
-        Follow-up: just the latest user message (agent already has context).
+        The cheap incremental path (send only the new user message) is taken
+        only when the cached SDK agent is provably in sync with Hermes'
+        message array: since the last successful turn, exactly our own
+        assistant reply plus one new user message were appended. Anything
+        else — context compression, /undo, session resume, process restart,
+        tool results in the tail, TTL eviction — closes the stale agent and
+        replays the full transcript via ``_format_messages_as_prompt`` so no
+        history is ever silently dropped.
         """
-        if is_new:
-            system_parts: list[str] = []
-            for msg in messages:
-                if isinstance(msg, dict) and msg.get("role") == "system":
-                    content = _render_message_content(msg.get("content"))
-                    if content:
-                        system_parts.append(content)
-            user_msg = ""
-            for msg in reversed(messages):
-                if isinstance(msg, dict) and msg.get("role") == "user":
-                    user_msg = _render_message_content(msg.get("content"))
-                    break
-            if system_parts and user_msg:
-                return "\n\n".join(system_parts) + "\n\n" + user_msg
-            return user_msg or _format_messages_as_prompt(messages)
+        stale_agent: Any | None = None
+        with self._sdk_lock:
+            self._cleanup_stale_agents()
+            agent = self._sdk_agents.get(conv_key)
+            synced = self._sdk_msg_counts.get(conv_key)
+            if (
+                agent is not None
+                and synced is not None
+                and len(msgs) == synced + 2
+                and isinstance(msgs[-2], dict)
+                and msgs[-2].get("role") == "assistant"
+                and isinstance(msgs[-1], dict)
+                and msgs[-1].get("role") == "user"
+            ):
+                prompt = _render_message_content(msgs[-1].get("content"))
+                if prompt:
+                    self._sdk_activity[conv_key] = time.monotonic()
+                    return agent, prompt
+            if agent is not None:
+                _logger.info(
+                    "SDK agent desynced (conv=%s synced=%s incoming=%d); "
+                    "replaying full transcript",
+                    conv_key,
+                    synced,
+                    len(msgs),
+                )
+                stale_agent = self._sdk_evict_locked(conv_key)
+        if stale_agent is not None:
+            try:
+                stale_agent.close()
+            except Exception:
+                pass
 
-        for msg in reversed(messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                return _render_message_content(msg.get("content"))
-        return ""
+        agent, _ = self._sdk_get_or_create_agent(conv_key, model)
+        return agent, _format_messages_as_prompt(msgs, model=model)
 
     def _sdk_chat_completion(
         self,
@@ -666,44 +971,68 @@ class CursorAgentClient:
         """Non-streaming completion via Cursor SDK (multi-turn)."""
         msgs = messages or []
         resolved_model = model or _resolve_default_model()
-        conv_id = self._conv_id(msgs)
-        agent, is_new = self._sdk_get_or_create_agent(conv_id, resolved_model)
-
-        prompt = self._sdk_build_prompt(msgs, is_new)
+        conv_key = self._conv_key(msgs, resolved_model)
+        agent, prompt = self._sdk_prepare_turn(conv_key, resolved_model, msgs)
         if not prompt:
             raise RuntimeError("No user message found in messages")
 
+        effective_timeout = self._resolve_timeout(timeout)
         run = agent.send(prompt)
+        done, timed_out = self._sdk_start_watchdog(
+            conv_key, agent, run, effective_timeout
+        )
 
         response_text = ""
         reasoning_text = ""
 
-        for msg in run.stream():
-            msg_type = getattr(msg, "type", "")
-            if msg_type == "assistant":
-                message_obj = getattr(msg, "message", None)
-                if message_obj:
-                    for block in getattr(message_obj, "content", []):
-                        if getattr(block, "type", "") == "text":
-                            response_text += getattr(block, "text", "")
-            elif msg_type == "thinking":
-                thinking = getattr(msg, "text", "")
-                if thinking:
-                    reasoning_text += thinking
+        try:
+            for msg in run.stream():
+                msg_type = getattr(msg, "type", "")
+                if msg_type == "assistant":
+                    message_obj = getattr(msg, "message", None)
+                    if message_obj:
+                        for block in getattr(message_obj, "content", []):
+                            if getattr(block, "type", "") == "text":
+                                response_text += getattr(block, "text", "")
+                elif msg_type == "thinking":
+                    thinking = getattr(msg, "text", "")
+                    if thinking:
+                        reasoning_text += thinking
 
-        result = run.wait()
-        if hasattr(result, "result") and result.result:
+            result = run.wait()
+        except Exception as exc:
+            self._sdk_evict(conv_key, expected=agent)
+            if timed_out.is_set():
+                raise TimeoutError(
+                    f"cursor-agent SDK turn timed out after {effective_timeout:.0f}s"
+                ) from exc
+            raise
+        finally:
+            done.set()
+
+        if timed_out.is_set():
+            self._sdk_evict(conv_key, expected=agent)
+            raise TimeoutError(
+                f"cursor-agent SDK turn timed out after {effective_timeout:.0f}s"
+            )
+
+        run_error = _sdk_run_error(result)
+        if not run_error and getattr(result, "result", None):
             response_text = result.result
+        if run_error and not response_text:
+            # Failed run leaves the agent state unknown; force a clean replay.
+            self._sdk_evict(conv_key, expected=agent)
+            raise RuntimeError(f"cursor-agent SDK run failed: {run_error}")
+        if run_error:
+            _logger.warning("SDK run reported an error after partial output: %s", run_error)
 
         with self._sdk_lock:
-            self._sdk_msg_counts[conv_id] = len(msgs) + 1
+            # Mark the agent as synced up to the full incoming array. Hermes
+            # appends our assistant reply next, so the following turn is
+            # incremental only when it arrives as exactly +assistant +user.
+            self._sdk_msg_counts[conv_key] = len(msgs)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = _sdk_extract_usage(result) or _zero_usage()
         assistant_message = SimpleNamespace(
             content=response_text,
             tool_calls=[],
@@ -729,45 +1058,74 @@ class CursorAgentClient:
         """Streaming completion via Cursor SDK — yields OpenAI chunks."""
         msgs = messages or []
         resolved_model = model or _resolve_default_model()
-        conv_id = self._conv_id(msgs)
-        agent, is_new = self._sdk_get_or_create_agent(conv_id, resolved_model)
-
-        prompt = self._sdk_build_prompt(msgs, is_new)
+        conv_key = self._conv_key(msgs, resolved_model)
+        agent, prompt = self._sdk_prepare_turn(conv_key, resolved_model, msgs)
         if not prompt:
             raise RuntimeError("No user message found in messages")
 
+        effective_timeout = self._resolve_timeout(timeout)
         run = agent.send(prompt)
+        done, timed_out = self._sdk_start_watchdog(
+            conv_key, agent, run, effective_timeout
+        )
 
-        for msg in run.stream():
-            msg_type = getattr(msg, "type", "")
-            if msg_type == "assistant":
-                message_obj = getattr(msg, "message", None)
-                if message_obj:
-                    for block in getattr(message_obj, "content", []):
-                        if getattr(block, "type", "") == "text":
-                            text = getattr(block, "text", "")
-                            if text:
-                                yield _make_stream_chunk(text, model=resolved_model)
-            elif msg_type == "thinking":
-                thinking = getattr(msg, "text", "")
-                if thinking:
-                    yield _make_stream_chunk(
-                        None, model=resolved_model, reasoning=thinking
-                    )
+        yielded_text = False
+        try:
+            for msg in run.stream():
+                msg_type = getattr(msg, "type", "")
+                if msg_type == "assistant":
+                    message_obj = getattr(msg, "message", None)
+                    if message_obj:
+                        for block in getattr(message_obj, "content", []):
+                            if getattr(block, "type", "") == "text":
+                                text = getattr(block, "text", "")
+                                if text:
+                                    yielded_text = True
+                                    yield _make_stream_chunk(text, model=resolved_model)
+                elif msg_type == "thinking":
+                    thinking = getattr(msg, "text", "")
+                    if thinking:
+                        yield _make_stream_chunk(
+                            None, model=resolved_model, reasoning=thinking
+                        )
 
-        run.wait()
+            result = run.wait()
+        except Exception as exc:
+            self._sdk_evict(conv_key, expected=agent)
+            if timed_out.is_set():
+                raise TimeoutError(
+                    f"cursor-agent SDK turn timed out after {effective_timeout:.0f}s"
+                ) from exc
+            raise
+        finally:
+            done.set()
+
+        if timed_out.is_set():
+            self._sdk_evict(conv_key, expected=agent)
+            raise TimeoutError(
+                f"cursor-agent SDK turn timed out after {effective_timeout:.0f}s"
+            )
+
+        run_error = _sdk_run_error(result)
+        if run_error and not yielded_text:
+            # Nothing visible was emitted; evict and raise so the stream
+            # wrapper can retry the whole turn via the CLI.
+            self._sdk_evict(conv_key, expected=agent)
+            raise RuntimeError(f"cursor-agent SDK run failed: {run_error}")
+        if run_error:
+            _logger.warning("SDK run reported an error after partial output: %s", run_error)
 
         with self._sdk_lock:
-            self._sdk_msg_counts[conv_id] = len(msgs) + 1
+            # Mark the agent as synced up to the full incoming array. Hermes
+            # appends our assistant reply next, so the following turn is
+            # incremental only when it arrives as exactly +assistant +user.
+            self._sdk_msg_counts[conv_key] = len(msgs)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
         yield _make_stream_chunk(
-            None, model=resolved_model, finish_reason="stop", usage=usage
+            None,
+            model=resolved_model,
+            finish_reason="stop",
+            usage=_sdk_extract_usage(result) or _zero_usage(),
         )
 
     # ------------------------------------------------------------------
