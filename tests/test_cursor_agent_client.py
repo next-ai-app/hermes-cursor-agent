@@ -159,6 +159,7 @@ def _install_fake_sdk(monkeypatch, run_factory=None):
         @staticmethod
         def create(**kwargs):
             agent = FakeAgent()
+            agent.create_kwargs = kwargs
             instances.append(agent)
             return agent
 
@@ -513,3 +514,94 @@ def test_sdk_turn_stats_track_incremental_vs_replay(monkeypatch):
 
     assert client._sdk_turn_stats == {"incremental": 1, "replay": 2}
     assert len(instances) == 2
+
+
+# ---------------------------------------------------------------------------
+# API key pool (CURSOR_API_KEYS rotation on usage limits)
+# ---------------------------------------------------------------------------
+
+
+def _fresh_pool(monkeypatch, *, single=None, pool=None):
+    """Reset the module key-pool singleton and configure the key env vars."""
+    if single is None:
+        monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("CURSOR_API_KEY", single)
+    if pool is None:
+        monkeypatch.delenv("CURSOR_API_KEYS", raising=False)
+    else:
+        monkeypatch.setenv("CURSOR_API_KEYS", pool)
+    fresh = mod._ApiKeyPool()
+    monkeypatch.setattr(mod, "_KEY_POOL", fresh)
+    return fresh
+
+
+def test_key_pool_merges_env_sources(monkeypatch):
+    _fresh_pool(monkeypatch, single="key-a", pool="key-b, key-a;key-c\nkey-d")
+    assert mod._ApiKeyPool.configured_keys() == ["key-a", "key-b", "key-c", "key-d"]
+
+
+def test_key_pool_single_key_setup_unchanged(monkeypatch):
+    pool = _fresh_pool(monkeypatch, single="key-a")
+    assert pool.active() == "key-a"
+    # Exhausted with no alternative: same key stays active (soonest recovery),
+    # exactly the old single-key behaviour.
+    assert pool.mark_limited("key-a") is None
+    assert pool.active() == "key-a"
+
+
+def test_key_pool_rotates_on_usage_limit(monkeypatch):
+    pool = _fresh_pool(monkeypatch, pool="key-a,key-b,key-c")
+    assert pool.active() == "key-a"
+    assert pool.mark_limited("key-a") == "key-b"
+    assert pool.active() == "key-b"
+    assert pool.mark_limited("key-b") == "key-c"
+    assert pool.mark_limited("key-c") is None  # everything cooling down
+    assert pool.active() in {"key-a", "key-b", "key-c"}  # soonest recovery
+
+
+def test_resolve_api_key_explicit_and_pool(monkeypatch):
+    pool = _fresh_pool(monkeypatch, pool="key-a,key-b")
+    # A key outside the pool (constructor/test override) wins as-is.
+    assert mod._resolve_api_key("other-key") == "other-key"
+    # A pool member defers to the pool, so rotation applies to it too.
+    pool.mark_limited("key-a")
+    assert mod._resolve_api_key("key-a") == "key-b"
+
+
+def test_usage_limit_retry_prefers_next_key_then_auto(monkeypatch):
+    _fresh_pool(monkeypatch, pool="key-a,key-b")
+    # Another healthy key exists: retry the same model on it.
+    assert mod._usage_limit_retry_model("composer-2.5", "key-a") == "composer-2.5"
+    # Last key exhausted: downgrade to auto.
+    assert mod._usage_limit_retry_model("composer-2.5", "key-b") == "auto"
+    # Already on auto with nothing left: give up.
+    assert mod._usage_limit_retry_model("auto", "key-b") is None
+
+
+def test_sdk_usage_limit_rotates_pool_key(monkeypatch):
+    def _failed_run():
+        return _FakeRun(result=SimpleNamespace(result=None, error="out of usage"))
+
+    instances = _install_fake_sdk(monkeypatch, run_factory=_failed_run)
+    pool = _fresh_pool(monkeypatch, pool="key-a,key-b")
+    client = mod.CursorAgentClient(cursor_cwd="/tmp")
+
+    with pytest.raises(RuntimeError, match="out of usage"):
+        client._sdk_chat_completion(model="auto", messages=[_m("user", "hi")])
+
+    assert instances[0].create_kwargs["api_key"] == "key-a"
+    assert pool.active() == "key-b"  # exhausted key cooled down
+
+    with pytest.raises(RuntimeError, match="out of usage"):
+        client._sdk_chat_completion(model="auto", messages=[_m("user", "hi")])
+    assert instances[1].create_kwargs["api_key"] == "key-b"
+
+
+def test_usage_limit_does_not_disable_sdk(monkeypatch):
+    _fresh_pool(monkeypatch, pool="key-a,key-b")
+    client = _make_client()
+    client._mark_sdk_failure("stream", RuntimeError("out of usage. Switch to Auto"))
+    assert client._sdk_active()  # key rotated; SDK path stays preferred
+    client._mark_sdk_failure("stream", RuntimeError("bridge crashed"))
+    assert not client._sdk_active()  # real failures still trigger the cooldown

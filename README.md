@@ -83,18 +83,35 @@ cp -a model-providers/cursor-agent ~/.hermes/plugins/model-providers/
 
 | Variable | Purpose |
 |----------|---------|
-| `CURSOR_API_KEY` | Required. Cursor API key |
+| `CURSOR_API_KEY` | Cursor API key (required unless `CURSOR_API_KEYS` is set) |
+| `CURSOR_API_KEYS` | Optional key pool: comma/semicolon/whitespace-separated keys |
+| `HERMES_CURSOR_KEY_COOLDOWN_SECONDS` | Cooldown for a usage-limited pool key (default: `3600`) |
 | `HERMES_CURSOR_AGENT_COMMAND` | Override CLI binary (default: `cursor-agent`) |
 | `CURSOR_AGENT_PATH` | Alias for command override |
 | `HERMES_CURSOR_AGENT_ARGS` | Extra CLI args (shell-split) |
 | `HERMES_CURSOR_DEFAULT_MODEL` | Default model when none specified (default: `auto`) |
 | `CURSOR_AGENT_BASE_URL` | Marker base URL override (default: `acp://cursor`) |
 
+## API key pool
+
+Set `CURSOR_API_KEYS` to rotate across multiple Cursor accounts:
+
+```bash
+# ~/.hermes/.env
+CURSOR_API_KEYS=key_one,key_two,key_three
+```
+
+`CURSOR_API_KEY` (if also set) stays first in the pool, so existing setups
+are unaffected. When the active key reports a usage limit, it is put on a
+cooldown (default 1 h) and the next healthy key takes over transparently —
+the request is retried with the same model before any downgrade to `auto`.
+The env is re-read on every request, so keys can be added without a restart.
+
 ## Streaming
 
 When Hermes requests `stream=True`, the client forwards `cursor-agent` incremental `assistant` deltas as OpenAI-style chunks so UIs show text progressively.
 
-If a named model is out of usage, the client transparently retries once with `auto`.
+If a model reports a usage limit, the client transparently retries on the next pool key (same model), then falls back to `auto`.
 
 ## Live log filter (optional)
 
