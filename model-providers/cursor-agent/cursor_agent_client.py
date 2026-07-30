@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -99,6 +100,23 @@ def _resolve_default_model() -> str:
 
 def _is_usage_limit(text: str | None) -> bool:
     return bool(text and _USAGE_LIMIT_RE.search(text))
+
+
+def _kill_process_group(proc: "subprocess.Popen[str]") -> None:
+    """Kill the process AND its children.
+
+    Subprocesses are spawned with ``start_new_session=True`` so the whole
+    group can be signalled. A bare ``proc.kill()`` only kills the direct
+    child; grandchildren (e.g. tools cursor-agent spawns) keep the stdout
+    pipe open, so the reader stays blocked past the timeout.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _resolve_command() -> str:
@@ -638,6 +656,42 @@ def fetch_cursor_models(
     return models or None
 
 
+def _sdk_normalize_model(model: str, *, api_key: str | None = None) -> str:
+    """Map a CLI variant name to the base id the SDK catalog accepts.
+
+    The CLI advertises ~193 variant ids (``claude-fable-5-thinking-high``,
+    ``gpt-5.5-medium``…) but the SDK API only accepts ~33 base ids
+    (``claude-fable-5``, ``gpt-5.5``…) and rejects variants with
+    ``invalid_argument: Cannot use this model``. Normalizing here avoids a
+    guaranteed SDK failure (and the pointless 300s CLI cooldown it triggers)
+    on every turn that uses a variant name. Unknown names are returned
+    unchanged so the real API error still surfaces.
+    """
+    if not model:
+        return model
+    catalog = fetch_cursor_models(api_key=api_key)
+    if not catalog:
+        return model
+    if model == "auto" and "auto" not in catalog:
+        # The send path's default-model id is "default"; the catalog display
+        # maps it to "auto", so reverse-map here.
+        return "default"
+    if model in catalog:
+        return model
+    # Longest catalog id that is a prefix of the requested variant, e.g.
+    # "gpt-5.4-mini-high" -> "gpt-5.4-mini" (not "gpt-5.4").
+    candidates = [c for c in catalog if c != "auto" and model.startswith(c + "-")]
+    if candidates:
+        base = max(candidates, key=len)
+        _logger.info(
+            "SDK catalog has no %r; using its base model %r for the SDK path",
+            model,
+            base,
+        )
+        return base
+    return model
+
+
 class _CursorChatCompletions:
     def __init__(self, client: "CursorAgentClient"):
         self._client = client
@@ -986,7 +1040,7 @@ class CursorAgentClient:
     ) -> Any:
         """Non-streaming completion via Cursor SDK (multi-turn)."""
         msgs = messages or []
-        resolved_model = model or _resolve_default_model()
+        resolved_model = _sdk_normalize_model(model or _resolve_default_model())
         conv_key = self._conv_key(msgs, resolved_model)
         agent, prompt = self._sdk_prepare_turn(conv_key, resolved_model, msgs)
         if not prompt:
@@ -1073,7 +1127,7 @@ class CursorAgentClient:
     ) -> Any:
         """Streaming completion via Cursor SDK — yields OpenAI chunks."""
         msgs = messages or []
-        resolved_model = model or _resolve_default_model()
+        resolved_model = _sdk_normalize_model(model or _resolve_default_model())
         conv_key = self._conv_key(msgs, resolved_model)
         agent, prompt = self._sdk_prepare_turn(conv_key, resolved_model, msgs)
         if not prompt:
@@ -1244,6 +1298,7 @@ class CursorAgentClient:
                 bufsize=1,
                 cwd=self._cursor_cwd,
                 env=_build_subprocess_env(),
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -1279,10 +1334,7 @@ class CursorAgentClient:
             if done_event.wait(timeout_seconds):
                 return
             if proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                _kill_process_group(proc)
 
         watch_thread = threading.Thread(target=_watchdog, daemon=True)
         watch_thread.start()
@@ -1350,10 +1402,7 @@ class CursorAgentClient:
                     self._active_process = None
             self.is_closed = True
             if proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                _kill_process_group(proc)
 
         stderr_text = "\n".join(stderr_tail).strip()
 
@@ -1389,6 +1438,19 @@ class CursorAgentClient:
                 raise RuntimeError(f"cursor-agent exited without a response: {detail}")
             elif stderr_text:
                 raise RuntimeError(f"cursor-agent produced no response: {stderr_text}")
+            else:
+                # Exit 0 with no stdout AND no stderr: the CLI swallowed the
+                # failure (seen with models pending a data-retention-policy
+                # acknowledgement — the account-level ActionRequiredError only
+                # appears on some paths). Hermes would otherwise report a
+                # bare "Empty response"; give the user the actionable cause.
+                raise RuntimeError(
+                    f"cursor-agent returned an empty response (exit code 0, "
+                    f"no output, model={model}). The model may be unavailable "
+                    "on this account or require acknowledgement in Cursor "
+                    "(e.g. a data-retention policy) — try /model to pick "
+                    "another one."
+                )
 
         final_usage = real_usage or SimpleNamespace(
             prompt_tokens=0,
@@ -1468,6 +1530,7 @@ class CursorAgentClient:
                 bufsize=1,
                 cwd=self._cursor_cwd,
                 env=_build_subprocess_env(),
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -1496,17 +1559,36 @@ class CursorAgentClient:
         err_thread = threading.Thread(target=_stderr_reader, daemon=True)
         err_thread.start()
 
+        # Wall-clock watchdog: `for line in proc.stdout` blocks until EOF, so
+        # without this a hung cursor-agent blocked the turn forever — the
+        # proc.wait(timeout=...) below is only reached after the read loop
+        # ends. Kill only THIS process; never self.close(), which would wipe
+        # every cached SDK agent on the client.
+        done_event = threading.Event()
+        timed_out = threading.Event()
+
+        def _watchdog() -> None:
+            if done_event.wait(timeout_seconds):
+                return
+            timed_out.set()
+            if proc.poll() is None:
+                _kill_process_group(proc)
+
+        watch_thread = threading.Thread(target=_watchdog, daemon=True)
+        watch_thread.start()
+
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 stdout_lines.append(line.rstrip("\n"))
-            proc.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            self.close()
-            raise TimeoutError(
-                f"Timed out waiting for cursor-agent response after {timeout_seconds:.0f}s."
-            ) from exc
+            if timed_out.is_set():
+                raise TimeoutError(
+                    f"cursor-agent hung; killed after {timeout_seconds:.0f}s "
+                    f"(model={model})."
+                )
+            proc.wait(timeout=10)
         finally:
+            done_event.set()
             err_thread.join(timeout=1)
             with self._active_process_lock:
                 if self._active_process is proc:
@@ -1541,4 +1623,14 @@ class CursorAgentClient:
         if stderr_text:
             raise RuntimeError(f"cursor-agent produced no response: {stderr_text}")
 
-        return "", "", None
+        # Exit 0 with no stdout AND no stderr: the CLI swallowed the failure
+        # (seen with models pending a data-retention-policy acknowledgement).
+        # Never return "" silently — Hermes would surface a bare "Empty
+        # response" with no clue about the cause.
+        raise RuntimeError(
+            f"cursor-agent returned an empty response (exit code 0, "
+            f"no output, model={model}). The model may be unavailable "
+            "on this account or require acknowledgement in Cursor "
+            "(e.g. a data-retention policy) — try /model to pick "
+            "another one."
+        )
