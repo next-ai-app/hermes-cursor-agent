@@ -1096,6 +1096,28 @@ class CursorAgentClient:
         if run_error:
             _logger.warning("SDK run reported an error after partial output: %s", run_error)
 
+        if not response_text and not reasoning_text:
+            # A "successful" run with no text and no error means the SDK
+            # transport is dead (observed in production: instant empty
+            # replies on every turn, across brand-new sessions, until the
+            # whole process was restarted). Returning "" here surfaces in
+            # Hermes as a bare "Empty response" with no fallback — raise so
+            # the caller routes this turn (and, via the failure cooldown,
+            # the next few minutes of turns) to the CLI instead.
+            self._sdk_evict(conv_key, expected=agent)
+            _logger.warning(
+                "SDK run returned empty content without an error "
+                "(subtype=%r is_error=%r result=%r); treating as SDK failure",
+                getattr(result, "subtype", None),
+                getattr(result, "is_error", None),
+                getattr(result, "result", None),
+            )
+            raise RuntimeError(
+                "cursor-agent SDK returned an empty response without an "
+                f"error (model={resolved_model}); the SDK transport is "
+                "likely stuck — retrying this turn via the CLI path."
+            )
+
         with self._sdk_lock:
             # Mark the agent as synced up to the full incoming array. Hermes
             # appends our assistant reply next, so the following turn is
@@ -1184,6 +1206,33 @@ class CursorAgentClient:
             raise RuntimeError(f"cursor-agent SDK run failed: {run_error}")
         if run_error:
             _logger.warning("SDK run reported an error after partial output: %s", run_error)
+
+        if not yielded_text:
+            # Some SDK runs emit no assistant deltas and put the whole reply
+            # in the final result (the CLI path handles the same case via
+            # its `result` event). Emit it as one chunk so the reply isn't
+            # lost.
+            final_text = str(getattr(result, "result", "") or "").strip()
+            if final_text:
+                yield _make_stream_chunk(final_text, model=resolved_model)
+                yielded_text = True
+
+        if not yielded_text and not run_error:
+            # Same dead-transport case as the non-streaming path: a
+            # "successful" run that emitted nothing. Raising before any
+            # chunk lets _sdk_stream_with_cli_fallback retry via the CLI.
+            self._sdk_evict(conv_key, expected=agent)
+            _logger.warning(
+                "SDK stream yielded no content and no error "
+                "(subtype=%r is_error=%r); treating as SDK failure",
+                getattr(result, "subtype", None),
+                getattr(result, "is_error", None),
+            )
+            raise RuntimeError(
+                "cursor-agent SDK streamed an empty response without an "
+                f"error (model={resolved_model}); the SDK transport is "
+                "likely stuck — retrying this turn via the CLI path."
+            )
 
         with self._sdk_lock:
             # Mark the agent as synced up to the full incoming array. Hermes

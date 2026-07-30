@@ -590,3 +590,41 @@ def test_run_prompt_stream_empty_response_raises(tmp_path):
     gen = client._run_prompt_stream("hi", model="claude-fable-5", timeout_seconds=5.0)
     with pytest.raises(RuntimeError, match="empty response"):
         list(gen)
+
+
+# ---------------------------------------------------------------------------
+# Dead SDK transport: empty "successful" runs must surface + fall back to CLI
+# ---------------------------------------------------------------------------
+
+
+def _empty_result():
+    return SimpleNamespace(result="", subtype="success", is_error=False, usage=None)
+
+
+def test_sdk_empty_result_raises_and_evicts(monkeypatch):
+    _install_fake_sdk(monkeypatch, run_factory=lambda: _FakeRun(result=_empty_result()))
+    client = _make_client()
+    msgs = [_m("system", "Be concise."), _m("user", "Hello")]
+    with pytest.raises(RuntimeError, match="empty response"):
+        client._sdk_chat_completion(model="auto", messages=msgs)
+    # The stale agent must be dropped so the next turn starts clean.
+    assert client._sdk_agents == {}
+
+
+def test_sdk_stream_empty_falls_back_to_cli(monkeypatch):
+    _install_fake_sdk(monkeypatch, run_factory=lambda: _FakeRun(result=_empty_result()))
+    client = _make_client()
+
+    def fake_cli_stream(**kwargs):
+        yield mod._make_stream_chunk("cli-reply", model=kwargs.get("model"))
+        yield mod._make_stream_chunk(None, model=kwargs.get("model"), finish_reason="stop")
+
+    monkeypatch.setattr(client, "_create_chat_completion_stream", fake_cli_stream)
+    msgs = [_m("system", "Be concise."), _m("user", "Hello")]
+    chunks = list(
+        client._sdk_stream_with_cli_fallback(model="auto", messages=msgs, stream=True)
+    )
+    texts = [c.choices[0].delta.content for c in chunks if c.choices[0].delta.content]
+    assert texts == ["cli-reply"]
+    # The empty SDK turn marks the SDK as failed so subsequent turns go CLI.
+    assert client._sdk_active() is False
