@@ -513,3 +513,80 @@ def test_sdk_turn_stats_track_incremental_vs_replay(monkeypatch):
 
     assert client._sdk_turn_stats == {"incremental": 1, "replay": 2}
     assert len(instances) == 2
+
+
+# ---------------------------------------------------------------------------
+# Model normalization, CLI timeout watchdog, and error surfacing
+# ---------------------------------------------------------------------------
+
+
+def _write_stub(tmp_path, name, body):
+    path = tmp_path / name
+    path.write_text(body)
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_sdk_normalize_model_maps_variant_to_base(monkeypatch):
+    catalog = [
+        "claude-fable-5", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+        "composer-2.5", "composer-2", "kimi-k3",
+    ]
+    monkeypatch.setattr(mod, "fetch_cursor_models", lambda **_: list(catalog))
+    assert mod._sdk_normalize_model("claude-fable-5-thinking-high") == "claude-fable-5"
+    assert mod._sdk_normalize_model("gpt-5.5-medium") == "gpt-5.5"
+    # Longest-prefix wins: gpt-5.4-mini, not gpt-5.4.
+    assert mod._sdk_normalize_model("gpt-5.4-mini-high") == "gpt-5.4-mini"
+    assert mod._sdk_normalize_model("composer-2.5-fast") == "composer-2.5"
+    assert mod._sdk_normalize_model("gpt-5.5") == "gpt-5.5"
+
+
+def test_sdk_normalize_model_auto_maps_to_default(monkeypatch):
+    monkeypatch.setattr(mod, "fetch_cursor_models", lambda **_: ["gpt-5.5"])
+    assert mod._sdk_normalize_model("auto") == "default"
+
+
+def test_sdk_normalize_model_unknown_or_no_catalog_unchanged(monkeypatch):
+    monkeypatch.setattr(mod, "fetch_cursor_models", lambda **_: ["gpt-5.5"])
+    assert mod._sdk_normalize_model("some-future-model") == "some-future-model"
+    monkeypatch.setattr(mod, "fetch_cursor_models", lambda **_: None)
+    assert mod._sdk_normalize_model("gpt-5.5-medium") == "gpt-5.5-medium"
+
+
+def test_run_prompt_hang_times_out_without_wiping_sdk_agents(tmp_path):
+    stub = _write_stub(tmp_path, "hang.sh", "#!/bin/sh\nsleep 30\n")
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    sentinel = object()
+    client._sdk_agents["conv"] = sentinel
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        client._run_prompt("hi", model="auto", timeout_seconds=1.0)
+    assert time.monotonic() - start < 10
+    # A timeout must kill only the hung process, never the SDK agent cache.
+    assert client._sdk_agents.get("conv") is sentinel
+
+
+def test_run_prompt_empty_response_raises_actionable_error(tmp_path):
+    stub = _write_stub(tmp_path, "empty.sh", "#!/bin/sh\nexit 0\n")
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    with pytest.raises(RuntimeError, match="empty response"):
+        client._run_prompt("hi", model="claude-fable-5", timeout_seconds=5.0)
+
+
+def test_run_prompt_stderr_is_surfaced(tmp_path):
+    stub = _write_stub(
+        tmp_path,
+        "stderr.sh",
+        "#!/bin/sh\necho 'ActionRequiredError: Review Data Policy' >&2\nexit 0\n",
+    )
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    with pytest.raises(RuntimeError, match="ActionRequiredError"):
+        client._run_prompt("hi", model="claude-fable-5", timeout_seconds=5.0)
+
+
+def test_run_prompt_stream_empty_response_raises(tmp_path):
+    stub = _write_stub(tmp_path, "empty_stream.sh", "#!/bin/sh\nexit 0\n")
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    gen = client._run_prompt_stream("hi", model="claude-fable-5", timeout_seconds=5.0)
+    with pytest.raises(RuntimeError, match="empty response"):
+        list(gen)
