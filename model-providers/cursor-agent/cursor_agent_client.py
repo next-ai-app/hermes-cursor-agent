@@ -72,8 +72,8 @@ _SDK_FAILURE_COOLDOWN_SECONDS = 300.0
 #   so this stops the 900s mute-kill that previously wiped long turns.
 #   idle kill: no stdout lines AT ALL for this long means the pipe is
 #   stalled (network) — kill and raise instead of hanging silently.
-_STREAM_HEARTBEAT_S = 30.0
-_STREAM_IDLE_KILL_S = 180.0
+_STREAM_HEARTBEAT_S = float(os.environ.get("HERMES_CURSOR_STREAM_HEARTBEAT_S", "30"))
+_STREAM_IDLE_KILL_S = float(os.environ.get("HERMES_CURSOR_STREAM_IDLE_KILL_S", "180"))
 
 
 def _default_timeout_seconds() -> float:
