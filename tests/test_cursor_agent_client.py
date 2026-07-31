@@ -628,3 +628,59 @@ def test_sdk_stream_empty_falls_back_to_cli(monkeypatch):
     assert texts == ["cli-reply"]
     # The empty SDK turn marks the SDK as failed so subsequent turns go CLI.
     assert client._sdk_active() is False
+
+
+# ---------------------------------------------------------------------------
+# Stream liveness: tool-event surfacing, heartbeats, and idle-stall kill
+# ---------------------------------------------------------------------------
+
+
+def test_stream_tool_call_events_surface_as_reasoning(tmp_path):
+    stub = _write_stub(
+        tmp_path,
+        "tools.sh",
+        "#!/bin/sh\n"
+        "printf '%s\\n' '{\"type\":\"tool_call\",\"subtype\":\"started\",\"tool_call\":{\"readToolCall\":{\"args\":{\"path\":\"x.py\"}}}}'\n"
+        "printf '%s\\n' '{\"type\":\"assistant\",\"timestamp_ms\":1,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}'\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hello\"}'\n",
+    )
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    chunks = list(client._run_prompt_stream("hi", model="auto", timeout_seconds=10.0))
+    reasoning = [c.choices[0].delta.reasoning for c in chunks if c.choices[0].delta.reasoning]
+    content = "".join(
+        c.choices[0].delta.content or "" for c in chunks if c.choices[0].delta.content
+    )
+    assert any("read" in r for r in reasoning)
+    assert content == "hello"
+
+
+def test_stream_idle_stall_is_killed_fast(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "_STREAM_HEARTBEAT_S", 0.1)
+    monkeypatch.setattr(mod, "_STREAM_IDLE_KILL_S", 0.4)
+    stub = _write_stub(tmp_path, "silent.sh", "#!/bin/sh\nsleep 30\n")
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="no output"):
+        list(client._run_prompt_stream("hi", model="auto", timeout_seconds=30.0))
+    assert time.monotonic() - start < 10
+
+
+def test_stream_busy_turn_emits_heartbeats(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "_STREAM_HEARTBEAT_S", 0.1)
+    monkeypatch.setattr(mod, "_STREAM_IDLE_KILL_S", 30.0)
+    stub = _write_stub(
+        tmp_path,
+        "busy.sh",
+        "#!/bin/sh\n"
+        "printf '%s\\n' '{\"type\":\"tool_call\",\"subtype\":\"started\",\"tool_call\":{\"name\":\"Shell\"}}'\n"
+        "sleep 1\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\n",
+    )
+    client = mod.CursorAgentClient(command=stub, cursor_cwd=str(tmp_path))
+    chunks = list(client._run_prompt_stream("hi", model="auto", timeout_seconds=30.0))
+    reasoning = [c.choices[0].delta.reasoning for c in chunks if c.choices[0].delta.reasoning]
+    assert any("still working" in r and "Shell" in r for r in reasoning)
+    content = "".join(
+        c.choices[0].delta.content or "" for c in chunks if c.choices[0].delta.content
+    )
+    assert content == "done"
