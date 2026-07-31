@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -64,6 +65,15 @@ _AGENT_TTL_SECONDS = _agent_ttl_seconds()
 # bridge hiccup downgraded the whole process to full-transcript-per-request
 # CLI mode until restart.
 _SDK_FAILURE_COOLDOWN_SECONDS = 300.0
+# Streaming liveness knobs (module-level so tests can shrink them):
+#   heartbeat: when NDJSON events are flowing (tool calls, agentic work)
+#   but nothing yieldable reached Hermes for this long, emit a reasoning
+#   keep-alive chunk. Hermes resets its stale-stream timer on ANY chunk,
+#   so this stops the 900s mute-kill that previously wiped long turns.
+#   idle kill: no stdout lines AT ALL for this long means the pipe is
+#   stalled (network) — kill and raise instead of hanging silently.
+_STREAM_HEARTBEAT_S = 30.0
+_STREAM_IDLE_KILL_S = 180.0
 
 
 def _default_timeout_seconds() -> float:
@@ -467,7 +477,35 @@ def _zero_usage() -> Any:
     )
 
 
-def parse_cursor_stream_line(line: str) -> dict[str, Any] | None:
+def _extract_tool_name(event: dict) -> str:
+    """Best-effort tool name from a cursor-agent ``tool_call`` NDJSON event.
+
+    The CLI's exact shape has varied across versions (``{"tool_call":
+    {"name": ...}}``, ``{"tool_call": {"readToolCall": {...}}}``, flat
+    ``name``), so probe several layouts and stay quiet when unknown.
+    """
+    tool = event.get("tool_call")
+    if isinstance(tool, dict):
+        for key in ("name", "tool_name", "tool"):
+            value = tool.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        function = tool.get("function")
+        if isinstance(function, dict):
+            value = function.get("name")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in tool:
+            if key.endswith("ToolCall") and len(key) > len("ToolCall"):
+                return key[: -len("ToolCall")]
+    for key in ("name", "tool_name"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def parse_cursor_stream_line(line: str) -> dict | None:
     stripped = (line or "").strip()
     if not stripped or not stripped.startswith("{"):
         return None
@@ -1394,9 +1432,66 @@ class CursorAgentClient:
         accumulated_reasoning = ""
         real_usage: Any = None
 
+        line_queue: "queue.Queue[Any]" = queue.Queue()
+        eof_sentinel = object()
+
+        def _stdout_reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    line_queue.put(raw_line)
+            finally:
+                line_queue.put(eof_sentinel)
+
+        read_thread = threading.Thread(target=_stdout_reader, daemon=True)
+        read_thread.start()
+
+        start_ts = time.monotonic()
+        last_line_ts = start_ts   # last time ANY stdout line arrived
+        last_yield_ts = start_ts  # last time a chunk reached Hermes
+        last_tool_status = ""
+
         try:
-            assert proc.stdout is not None
-            for raw_line in proc.stdout:
+            while True:
+                try:
+                    item = line_queue.get(timeout=_STREAM_HEARTBEAT_S)
+                except queue.Empty:
+                    item = None
+                now = time.monotonic()
+                if item is None:
+                    # No stdout line for a full heartbeat interval.
+                    silent_for = now - last_line_ts
+                    if silent_for >= _STREAM_IDLE_KILL_S:
+                        # Truly stalled pipe (network) — kill and surface a
+                        # real reason instead of hanging until Hermes' 900s
+                        # mute-kill.
+                        _kill_process_group(proc)
+                        raise RuntimeError(
+                            f"cursor-agent produced no output for "
+                            f"{int(silent_for)}s (model={model}) — the "
+                            "connection to Cursor's API is likely stalled; "
+                            "killed the process so the turn can retry."
+                        )
+                    if now - last_yield_ts >= _STREAM_HEARTBEAT_S:
+                        # Events are flowing (agentic tool work) but nothing
+                        # yieldable reached Hermes. Emit a keep-alive chunk:
+                        # Hermes resets its stale timer on ANY chunk, and the
+                        # user sees what the agent is doing.
+                        last_yield_ts = now
+                        status = last_tool_status or "processing (no reply text yet)"
+                        yield _make_stream_chunk(
+                            None,
+                            model=model,
+                            reasoning=(
+                                f"⏳ cursor-agent still working — {status} "
+                                f"({int(now - start_ts)}s elapsed)"
+                            ),
+                        )
+                    continue
+                if item is eof_sentinel:
+                    break
+                last_line_ts = now
+                raw_line = item
                 event = parse_cursor_stream_line(raw_line)
                 if not event:
                     continue
@@ -1408,6 +1503,7 @@ class CursorAgentClient:
                         chunk_text, chunk_reasoning = _extract_assistant_content(event)
                         if chunk_text or chunk_reasoning:
                             streamed_any = True
+                            last_yield_ts = time.monotonic()
                             yield _make_stream_chunk(
                                 chunk_text or None,
                                 model=model,
@@ -1419,6 +1515,23 @@ class CursorAgentClient:
                             final_result = chunk_text
                         if chunk_reasoning:
                             accumulated_reasoning += chunk_reasoning
+                elif event_type == "tool_call":
+                    # Previously dropped silently (a long agentic tool loop
+                    # therefore looked like a dead stream and got killed at
+                    # Hermes' 900s stale threshold). Surface the tool name as
+                    # a reasoning chunk: keeps the stream alive AND gives the
+                    # user real progress visibility.
+                    subtype = str(event.get("subtype") or "").strip().lower()
+                    if subtype in ("", "started"):
+                        tool_name = _extract_tool_name(event)
+                        if tool_name:
+                            last_tool_status = f"using tool: {tool_name}"
+                            last_yield_ts = now
+                            yield _make_stream_chunk(
+                                None,
+                                model=model,
+                                reasoning=f"🔧 {tool_name}",
+                            )
                 elif event_type == "result":
                     subtype = str(event.get("subtype") or "").strip().lower()
                     usage_data = event.get("usage")
