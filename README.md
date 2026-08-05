@@ -110,7 +110,9 @@ The plugin is designed to **surface the real error** instead of a bare "Empty re
 
 | Variable | Purpose |
 |----------|---------|
-| `CURSOR_API_KEY` | Required. Cursor API key |
+| `CURSOR_API_KEY` | Cursor API key (required unless `CURSOR_API_KEYS` is set) |
+| `CURSOR_API_KEYS` | Optional key pool: comma/semicolon/whitespace-separated keys |
+| `HERMES_CURSOR_KEY_COOLDOWN_SECONDS` | Cooldown for a usage-limited pool key (default: `3600`) |
 | `HERMES_CURSOR_AGENT_COMMAND` | Override CLI binary (default: `cursor-agent`) |
 | `CURSOR_AGENT_PATH` | Alias for command override |
 | `HERMES_CURSOR_AGENT_ARGS` | Extra CLI args (shell-split) |
@@ -120,6 +122,21 @@ The plugin is designed to **surface the real error** instead of a bare "Empty re
 | `HERMES_CURSOR_AGENT_TTL_SECONDS` | Model-catalog cache TTL |
 | `HERMES_CURSOR_STREAM_HEARTBEAT_S` | Keep-alive interval for busy turns (default: `30`) |
 | `HERMES_CURSOR_STREAM_IDLE_KILL_S` | Kill streams with zero output after this long (default: `180`) |
+
+## API key pool
+
+Set `CURSOR_API_KEYS` to rotate across multiple Cursor accounts:
+
+```bash
+# ~/.hermes/.env
+CURSOR_API_KEYS=key_one,key_two,key_three
+```
+
+`CURSOR_API_KEY` (if also set) stays first in the pool, so existing setups
+are unaffected. When the active key reports a usage limit, it is put on a
+cooldown (default 1 h) and the next healthy key takes over transparently —
+the request is retried with the same model before any downgrade to `auto`.
+The env is re-read on every request, so keys can be added without a restart.
 
 ## Streaming
 

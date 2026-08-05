@@ -137,8 +137,112 @@ def _resolve_command() -> str:
     )
 
 
+def _key_cooldown_seconds() -> float:
+    raw = os.getenv("HERMES_CURSOR_KEY_COOLDOWN_SECONDS", "").strip()
+    try:
+        return float(raw) if raw else 3600.0
+    except ValueError:
+        return 3600.0
+
+
+_KEY_SPLIT_RE = re.compile(r"[,;\s]+")
+
+
+class _ApiKeyPool:
+    """Rotating pool of Cursor API keys.
+
+    Keys come from ``CURSOR_API_KEYS`` (comma/semicolon/whitespace separated)
+    merged with the single ``CURSOR_API_KEY``, which stays first so existing
+    single-key setups behave exactly as before. The env is re-read on every
+    lookup, so keys can be added or removed without a restart.
+
+    A key that reports a usage limit is put on a cooldown and the next
+    healthy key takes over. When every key is cooling down, the one
+    recovering soonest is used — with a single configured key this degrades
+    to precisely the old behaviour (same key, model downgraded to auto).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cooldown_until: dict[str, float] = {}
+        self._preferred: str | None = None
+
+    @staticmethod
+    def configured_keys() -> list[str]:
+        keys: list[str] = []
+        single = os.getenv("CURSOR_API_KEY", "").strip()
+        if single:
+            keys.append(single)
+        for part in _KEY_SPLIT_RE.split(os.getenv("CURSOR_API_KEYS", "") or ""):
+            part = part.strip()
+            if part and part not in keys:
+                keys.append(part)
+        return keys
+
+    def active(self) -> str:
+        keys = self.configured_keys()
+        if not keys:
+            return ""
+        now = time.monotonic()
+        with self._lock:
+            healthy = [k for k in keys if self._cooldown_until.get(k, 0.0) <= now]
+            if healthy:
+                if self._preferred in healthy:
+                    return self._preferred
+                self._preferred = healthy[0]
+                return healthy[0]
+            # Every key is cooling down; use the one recovering soonest.
+            return min(keys, key=lambda k: self._cooldown_until.get(k, 0.0))
+
+    def mark_limited(self, key: str) -> str | None:
+        """Cool ``key`` down and promote the next healthy key, if any."""
+        key = (key or "").strip()
+        keys = self.configured_keys()
+        now = time.monotonic()
+        with self._lock:
+            if key:
+                self._cooldown_until[key] = now + _key_cooldown_seconds()
+            healthy = [
+                k
+                for k in keys
+                if k != key and self._cooldown_until.get(k, 0.0) <= now
+            ]
+            if not healthy:
+                return None
+            self._preferred = healthy[0]
+            _logger.warning(
+                "Cursor API key ...%s hit its usage limit; cooling it down for "
+                "%.0fs and rotating to key ...%s",
+                key[-4:],
+                _key_cooldown_seconds(),
+                self._preferred[-4:],
+            )
+            return self._preferred
+
+
+_KEY_POOL = _ApiKeyPool()
+
+
 def _resolve_api_key(explicit: str | None = None) -> str:
-    return (explicit or os.getenv("CURSOR_API_KEY", "") or "").strip()
+    explicit = (explicit or "").strip()
+    if explicit and explicit not in _KEY_POOL.configured_keys():
+        # A key set outside the pool (constructor/test override) wins as-is.
+        return explicit
+    return _KEY_POOL.active() or explicit
+
+
+def _usage_limit_retry_model(model: str, used_key: str) -> str | None:
+    """Pick the retry strategy after a usage-limit reply.
+
+    Rotate to the next healthy pool key first (keeping the requested model);
+    once no alternative key remains, downgrade to ``auto``; give up when
+    already on ``auto`` with no keys left to try.
+    """
+    if _KEY_POOL.mark_limited(used_key):
+        return model
+    if model != _AUTO_MODEL:
+        return _AUTO_MODEL
+    return None
 
 
 def _resolve_home_dir() -> str:
@@ -824,6 +928,9 @@ class CursorAgentClient:
         self._sdk_agents: dict[str, Any] = {}
         self._sdk_activity: dict[str, float] = {}
         self._sdk_msg_counts: dict[str, int] = {}
+        # API key each cached agent was created with, so a usage-limit
+        # failure cools down the right pool key.
+        self._sdk_agent_keys: dict[str, str] = {}
         # Running tally of cheap incremental turns vs full-transcript
         # replays, logged on each replay so a chronically desyncing setup
         # (e.g. over-eager context compression) is visible in the logs.
@@ -856,6 +963,7 @@ class CursorAgentClient:
             self._sdk_agents.clear()
             self._sdk_activity.clear()
             self._sdk_msg_counts.clear()
+            self._sdk_agent_keys.clear()
 
     # ------------------------------------------------------------------
     # SDK multi-turn agent methods
@@ -865,6 +973,17 @@ class CursorAgentClient:
         return time.monotonic() >= self._sdk_disabled_until
 
     def _mark_sdk_failure(self, where: str, exc: BaseException) -> None:
+        if _is_usage_limit(str(exc)):
+            # The SDK itself is healthy — a key/model ran out of quota and
+            # the key pool has already rotated. Keep the SDK path active so
+            # the next turn retries it with the fresh key; only this turn
+            # goes through the CLI.
+            _logger.warning(
+                "SDK %s hit a usage limit (%s); retrying via CLI this turn",
+                where,
+                exc,
+            )
+            return
         self._sdk_disabled_until = time.monotonic() + _SDK_FAILURE_COOLDOWN_SECONDS
         _logger.warning(
             "SDK %s failed (%s); using CLI for the next %.0fs",
@@ -925,6 +1044,7 @@ class CursorAgentClient:
         agent = self._sdk_agents.pop(conv_key, None)
         self._sdk_activity.pop(conv_key, None)
         self._sdk_msg_counts.pop(conv_key, None)
+        self._sdk_agent_keys.pop(conv_key, None)
         return agent
 
     def _sdk_evict(self, conv_key: str, expected: Any | None = None) -> None:
@@ -1001,6 +1121,7 @@ class CursorAgentClient:
             self._sdk_agents[conv_key] = agent
             self._sdk_activity[conv_key] = time.monotonic()
             self._sdk_msg_counts[conv_key] = 0
+            self._sdk_agent_keys[conv_key] = api_key or ""
             return agent, True
 
     def _sdk_prepare_turn(
@@ -1128,8 +1249,13 @@ class CursorAgentClient:
         if not run_error and getattr(result, "result", None):
             response_text = result.result
         if run_error and not response_text:
+            used_key = self._sdk_agent_keys.get(conv_key, "")
             # Failed run leaves the agent state unknown; force a clean replay.
             self._sdk_evict(conv_key, expected=agent)
+            if _is_usage_limit(run_error):
+                # Rotate the pool so the CLI fallback (and the next SDK
+                # turn) run on the next healthy key.
+                _KEY_POOL.mark_limited(used_key)
             raise RuntimeError(f"cursor-agent SDK run failed: {run_error}")
         if run_error:
             _logger.warning("SDK run reported an error after partial output: %s", run_error)
@@ -1238,9 +1364,14 @@ class CursorAgentClient:
 
         run_error = _sdk_run_error(result)
         if run_error and not yielded_text:
+            used_key = self._sdk_agent_keys.get(conv_key, "")
             # Nothing visible was emitted; evict and raise so the stream
             # wrapper can retry the whole turn via the CLI.
             self._sdk_evict(conv_key, expected=agent)
+            if _is_usage_limit(run_error):
+                # Rotate the pool so the CLI fallback (and the next SDK
+                # turn) run on the next healthy key.
+                _KEY_POOL.mark_limited(used_key)
             raise RuntimeError(f"cursor-agent SDK run failed: {run_error}")
         if run_error:
             _logger.warning("SDK run reported an error after partial output: %s", run_error)
@@ -1372,7 +1503,8 @@ class CursorAgentClient:
         )
 
     def _run_prompt_stream(self, prompt_text: str, *, model: str, timeout_seconds: float):
-        command = self._build_command(model=model, stream_partial=True)
+        used_key = self._current_api_key()
+        command = self._build_command(model=model, stream_partial=True, api_key=used_key)
         stderr_tail: deque[str] = deque(maxlen=40)
 
         try:
@@ -1568,20 +1700,22 @@ class CursorAgentClient:
 
         stderr_text = "\n".join(stderr_tail).strip()
 
-        # Transparent recovery: an out-of-usage model streams nothing but an
-        # "out of usage. Switch to Auto" status. Nothing has been yielded yet,
-        # so re-stream the same prompt with `auto` instead of erroring (and
-        # leaving the TUI streaming box half-rendered).
+        # Transparent recovery: an out-of-usage key/model streams nothing but
+        # an "out of usage. Switch to Auto" status. Nothing has been yielded
+        # yet, so re-stream the same prompt on the next pool key (same model),
+        # falling back to `auto`, instead of erroring (and leaving the TUI
+        # streaming box half-rendered).
         if (
             not streamed_any
             and not final_result
-            and model != _AUTO_MODEL
             and (_is_usage_limit(stderr_text) or _is_usage_limit(error_message))
         ):
-            yield from self._run_prompt_stream(
-                prompt_text, model=_AUTO_MODEL, timeout_seconds=timeout_seconds
-            )
-            return
+            retry_model = _usage_limit_retry_model(model, used_key)
+            if retry_model is not None:
+                yield from self._run_prompt_stream(
+                    prompt_text, model=retry_model, timeout_seconds=timeout_seconds
+                )
+                return
 
         # No incremental deltas reached the client (short replies, or a backend
         # that only emitted the canonical ``result`` event).  Emit the
@@ -1622,7 +1756,12 @@ class CursorAgentClient:
         )
         yield _make_stream_chunk(None, model=model, finish_reason="stop", usage=final_usage)
 
-    def _build_command(self, *, model: str, stream_partial: bool = False) -> list[str]:
+    def _current_api_key(self) -> str:
+        return _resolve_api_key(self.api_key if self.api_key != "cursor-agent" else None)
+
+    def _build_command(
+        self, *, model: str, stream_partial: bool = False, api_key: str | None = None
+    ) -> list[str]:
         cmd = [
             self._cursor_command,
             "-p",
@@ -1640,7 +1779,8 @@ class CursorAgentClient:
         # the user token-by-token.
         if stream_partial:
             cmd.append("--stream-partial-output")
-        api_key = _resolve_api_key(self.api_key if self.api_key != "cursor-agent" else None)
+        if api_key is None:
+            api_key = self._current_api_key()
         if api_key:
             cmd.extend(["--api-key", api_key])
         cmd.extend(self._cursor_args)
@@ -1679,7 +1819,8 @@ class CursorAgentClient:
         return thread
 
     def _run_prompt(self, prompt_text: str, *, model: str, timeout_seconds: float) -> tuple[str, str, Any]:
-        command = self._build_command(model=model)
+        used_key = self._current_api_key()
+        command = self._build_command(model=model, api_key=used_key)
         stderr_tail: deque[str] = deque(maxlen=40)
 
         try:
@@ -1760,17 +1901,18 @@ class CursorAgentClient:
         response_text, stream_error, reasoning_text, real_usage = parse_cursor_stream_events(stdout_lines)
         stderr_text = "\n".join(stderr_tail).strip()
 
-        # Transparent recovery: if the requested model is out of usage it emits
-        # no response events (only an "out of usage. Switch to Auto" status).
-        # Retry once with `auto` instead of surfacing an error to the user.
-        if (
-            not response_text
-            and model != _AUTO_MODEL
-            and (_is_usage_limit(stderr_text) or _is_usage_limit(stream_error))
+        # Transparent recovery: if the key/model is out of usage no response
+        # events are emitted (only an "out of usage. Switch to Auto" status).
+        # Rotate to the next pool key first (same model), then downgrade to
+        # `auto`, instead of surfacing an error to the user.
+        if not response_text and (
+            _is_usage_limit(stderr_text) or _is_usage_limit(stream_error)
         ):
-            return self._run_prompt(
-                prompt_text, model=_AUTO_MODEL, timeout_seconds=timeout_seconds
-            )
+            retry_model = _usage_limit_retry_model(model, used_key)
+            if retry_model is not None:
+                return self._run_prompt(
+                    prompt_text, model=retry_model, timeout_seconds=timeout_seconds
+                )
 
         if stream_error and not response_text:
             raise RuntimeError(f"cursor-agent failed: {stream_error}")

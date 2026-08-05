@@ -217,7 +217,8 @@ def _resolve_cursor_credentials(auth, provider_id: str):
     raw_args = os.getenv("HERMES_CURSOR_AGENT_ARGS", "").strip()
     args = shlex.split(raw_args) if raw_args else []
     resolved_command = shutil.which(command) if command else None
-    api_key = os.getenv("CURSOR_API_KEY", "").strip()
+    # Pool-aware: the active key from CURSOR_API_KEY and/or CURSOR_API_KEYS.
+    api_key = _client_mod._resolve_api_key()
 
     if not resolved_command:
         raise auth.AuthError(
@@ -228,7 +229,7 @@ def _resolve_cursor_credentials(auth, provider_id: str):
         )
     if not api_key:
         raise auth.AuthError(
-            "Cursor Agent requires CURSOR_API_KEY. "
+            "Cursor Agent requires CURSOR_API_KEY (or a CURSOR_API_KEYS pool). "
             "Set it in ~/.hermes/.env or export CURSOR_API_KEY.",
             provider="cursor-agent",
             code="missing_cursor_api_key",
@@ -272,7 +273,7 @@ def _cursor_status(auth):
         or os.getenv("CURSOR_AGENT_PATH", "").strip()
         or "cursor-agent"
     )
-    api_key = os.getenv("CURSOR_API_KEY", "").strip()
+    api_key = _client_mod._resolve_api_key()
     base_url = ""
     if pconfig.base_url_env_var:
         base_url = os.getenv(pconfig.base_url_env_var, "").strip()
